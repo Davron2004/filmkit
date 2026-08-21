@@ -1,0 +1,18 @@
+{
+  "name": "filmkit",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Film human-paced demo videos of any web or Android app: scripted flows + a dead-air cutter.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "film:web": "node film-web.mjs",
+    "film:android": "node film-android.mjs",
+    "tighten": "node tighten.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}

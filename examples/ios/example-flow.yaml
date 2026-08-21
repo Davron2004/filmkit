@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# examples/ios/example-flow.yaml — a TEMPLATE Maestro flow for film-ios.mjs.
+# Adapt the appId and selectors to YOUR app; the idioms below are the portable part. Run it:
+#
+#   node film-ios.mjs examples/ios/example-flow.yaml --simulator "iPhone 16 Pro" \
+#        --clean-status-bar --tighten
+#
+# The Maestro YAML DSL is shared between Android and iOS — most flows port by changing only
+# the appId and any platform-specific selectors. Debug what the OS actually sees with:
+#
+#   maestro hierarchy          # dumps the accessibility tree of the foreground screen
+#
+# PAUSE PRIMITIVE: Maestro has no first-class fixed-duration "sleep" command. Every explicit
+# pause below is `extendedWaitUntil: { visible: <marker that will never appear>, timeout: <ms>,
+# optional: true }` — it blocks for the full timeout and `optional: true` demotes the inevitable
+# "not found" outcome to a WARNED step instead of failing the flow.
+appId: com.apple.Preferences   # ← replace with your app's bundle id
+---
+# Beat 0 — launch into a known state. With --fresh --install <App> --app <bundle-id>, beat 0 is
+# a fresh-install first launch.
+- launchApp
+- extendedWaitUntil:
+    visible: ".*Settings.*"   # regex visibility wait — a real readiness marker beats a blind sleep
+    timeout: 5000
+
+# Beat 1 — dwell so the first screen reads on camera before anything moves.
+- extendedWaitUntil:
+    visible: "__filmkit_demo_pause_marker__"
+    timeout: 1800
+    optional: true
+
+# Beat 2 — an interaction via visible text.
+- tapOn: "General"
+- extendedWaitUntil:
+    visible: "__filmkit_demo_pause_marker__"
+    timeout: 1200
+    optional: true
+
+# Beat 3 — end on a held beat so the tightened video doesn't clip the last action.
+- extendedWaitUntil:
+    visible: "__filmkit_demo_pause_marker__"
+    timeout: 1600
+    optional: true

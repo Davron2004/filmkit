@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# examples/android/example-flow.yaml — a TEMPLATE Maestro flow for film-android.mjs.
+# Adapt the appId and selectors to YOUR app; the idioms below are the portable part. Run it:
+#
+#   node film-android.mjs examples/android/example-flow.yaml --tighten
+#
+# SELECTORS: prefer visible text or accessibilityLabel (what `maestro hierarchy` reads) over
+# coordinates — text survives layout changes and different screen sizes. Debug what the OS
+# actually sees with:
+#
+#   maestro hierarchy          # dumps the accessibility tree of the foreground screen
+#
+# PAUSE PRIMITIVE: Maestro has no first-class fixed-duration "sleep" command. Every explicit
+# pause below is `extendedWaitUntil: { visible: <marker that will never appear>, timeout: <ms>,
+# optional: true }` — it blocks for the full timeout and `optional: true` demotes the inevitable
+# "not found" outcome to a WARNED step instead of failing the flow.
+appId: com.android.settings   # ← replace with your app's package id
+---
+# Beat 0 — launch into a known state. If you passed --fresh --app <id>, beat 0 is a
+# fresh-first-run launch; otherwise whatever state the app was left in.
+- launchApp
+- waitForAnimationToEnd
+
+# Beat 1 — dwell so the first screen reads on camera before anything moves.
+- extendedWaitUntil:
+    visible: "__filmkit_demo_pause_marker__"
+    timeout: 2000
+    optional: true
+
+# Beat 2 — an interaction. Text/relative selector, no coordinates.
+- tapOn: "Network & internet"
+- waitForAnimationToEnd
+- extendedWaitUntil:
+    visible: "__filmkit_demo_pause_marker__"
+    timeout: 1200
+    optional: true
+
+# TEXT INPUT GOTCHA (hard-won): `inputText` alone APPENDS at the cursor, and `eraseText` is
+# unreliable in WebViews (React controlled inputs re-render a stray leading char that later
+# keystrokes never overwrite on screen). The clean select-then-replace gesture:
+#
+#   - longPressOn:            # triggers the native text-selection UI
+#       below: "Some Label"
+#   - tapOn: "Select all"
+#   - inputText: "86"
+#
+# `doubleTapOn` selects nothing in many WebViews — use longPressOn → "Select all".
+
+# Beat 3 — end on a held beat so the tightened video doesn't clip the last action.
+- extendedWaitUntil:
+    visible: "__filmkit_demo_pause_marker__"
+    timeout: 1600
+    optional: true
