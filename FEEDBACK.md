@@ -776,3 +776,111 @@ emitted frame rather than the requested time, and giving the `fps` then `trim` i
 would have saved me a wrong number in a progress log and one rebuilt assembly. A note in the
 sidecar would work too, since it already records that the container durations cannot be trusted
 for the same underlying reason.
+
+---
+
+# Web camera friction log — IEC Karla enrolment demo (2026-09-03)
+
+Written by an agent filming a 12-step operator walkthrough of a Firebase-hosted React SPA
+(Google sign-in, hash routing) with `film-web.mjs`. One take, first try, 66s wall clock for a
+60s video. Everything below actually happened.
+
+## 1. No way to film behind a login (missing feature)
+
+**Wanted:** film the live app at its real URL. It sits behind Google sign-in.
+
+**Happened:** `createStage` does `chromium.launch()` + `browser.newContext({ recordVideo })`.
+No `storageState`, no persistent profile, no CDP attach, no hook to run code before the
+recording starts. An agent must not type a human's password, so the live URL was unfilmable.
+
+**Did instead:** ran the project's Firebase emulators and used the app's own emulator-only
+`window.__test.signInAs()` hook from inside the flow via `stage.page.evaluate`. Same code, same
+SPA, but the footage shows stub scoring text and an emulator URL. The skill text never mentions
+auth at all, so the first twenty minutes went to discovering this.
+
+**Fix:** `--storage-state <file>` passed through to `newContext` (Playwright's `storageState`
+now carries IndexedDB, which is where Firebase Auth keeps its session), and a line in the skill
+that says what to do when the target needs a login.
+
+## 2. `--tighten` at defaults erases caption reading time (bug in the recommendation)
+
+**Wanted:** the skill says "Always pass --tighten".
+
+**Happened:** every `stage.caption(...)` followed by a `stage.pause(1800..2400)` is, to
+`freezedetect`, a static stretch, and `--keep 0.6` clamps it to 0.6s. Dry run on the take:
+19 freezes of 1.2-3.3s, all clamped, and the video went from 59.9s to 35.5s. The result is a video where no caption
+can be read. With `--keep 1.5`: 51.8s and the captions hold.
+
+**Fix:** either the skill says "captioned web flows: `--keep 1.5` or skip tighten", or the
+stage records the authored caption holds (it knows every `pause` it ran) and tighten spares
+them. The second is the real fix; the tool already has the information.
+
+## 3. `stage.click` does not wait for its target (ergonomics)
+
+**Happened:** `boxCenter` throws "no bounding box" if the element is not there yet. After every
+state change the flow needed `await stage.page.getByTestId('x').waitFor()` before the next
+`stage.click`. Twelve of those in one flow. Playwright's own `locator.click()` auto-waits; the
+stage's real-mouse click path skips that.
+
+**Fix:** `await locator.waitFor({ state: 'visible' })` inside `resolveLocator`, or a
+`stage.waitFor(target)` primitive so the flow reads as a shot list rather than a test.
+
+## 4. One `open()` per flow, and navigation kills the overlay (limitation, documented but costly)
+
+**Happened:** the demo has an applicant-side step on a different route. A `page.goto` would
+have dropped the injected cursor and caption overlay. Got away with it only because the app
+uses hash routing, so `location.hash = ...` re-rendered without a document load. A real
+multi-page demo, or the honest "guest opens the link in a fresh browser" beat, cannot be filmed
+into one video.
+
+**Fix:** re-inject the overlay on `page.on('framenavigated')` for the main frame, or add
+`stage.goto(url)` that does it explicitly.
+
+## 5. Output directory: skill and tool disagree (doc bug)
+
+**Happened:** the skill says output lands in `<cwd>/out` when run from the project.
+`lib/stage.mjs` has `DEFAULT_OUT_DIR = join(HERE, '..', 'out')`, filmkit's own `out/`, where
+other projects' takes already sit. Passed `--out` explicitly, so nothing was misplaced, but
+the skill text would have sent the video to the wrong repo.
+
+## 6. `tighten.mjs` overwrites `<in>-tight.mp4` without a word (missing feature)
+
+**Happened:** re-ran tighten with `--keep 1.5` to compare against the default cut. The default
+cut was gone. README promises the Android camera never clobbers a take and refuses in preflight;
+the web camera and standalone tighten have no `--name`, no `--force`, no refusal.
+
+## 7. "Explore off-camera in a Playwright REPL" is not an agent workflow (skill text)
+
+**Happened:** there is no REPL to open. What actually worked: read the project's own e2e spec
+for the same flow and lift its `data-testid` selectors verbatim, then confirm the one unknown
+(route gating) by grepping the app. The skill should say that first. It should also point at
+this file. FEEDBACK.md is the right place for exactly this, and the skill never mentions it.
+
+## What worked
+
+First take succeeded end to end. Deterministic pacing reads as human. The overlay survived
+twelve SPA route changes. One `--dry-run` on tighten was enough to show problem 2. Errors
+from the stage name the target that failed. The web camera is close; problems 2 and 3 are the
+ones an agent hits on every flow.
+
+## Resolved 2026-09-03
+
+1. Login: the default camera is now `--browser ego`, which films inside the user's own
+   already-signed-in browser, so there's no storage state to pass or manage at all.
+2. `--tighten` erasing captions: the web camera now writes its own caption/pause timeline into
+   the sidecar, and tighten reads it and protects those ranges instead of clamping them.
+3. `stage.click` not waiting: `resolveBox` now owns one shared 10s auto-wait that `click`,
+   `point`, and `type` all go through, and a new `stage.waitFor(target)` covers the case where
+   the wait isn't tied to an action at all.
+4. Navigation killing the overlay: the overlay now re-registers itself on every future document
+   from `open()` onward, and a new `stage.goto()` re-dresses it explicitly for a deliberate
+   second navigation mid-flow.
+5. Output directory disagreement: the skill text now says what the code has always done,
+   filmkit's own `out/`, and tells the reader to pass `--out` to land a take inside their own
+   project instead.
+6. Silent tighten overwrite: both `film-web.mjs` and standalone `tighten.mjs` now refuse to
+   overwrite an existing take in preflight, the same way the Android camera does, with `--force`
+   to override it on purpose.
+7. "Playwright REPL" exploration advice: the two-pass workflow now says to read the project's
+   own e2e specs for selectors first, then confirm the unknowns with `snapshotText()` inside
+   ego-browser, and points at this file as where to log friction after a run.
