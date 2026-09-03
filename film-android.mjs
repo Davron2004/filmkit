@@ -10,7 +10,7 @@
 //   node film-android.mjs <flow.yaml> [--out <dir>] [--name <basename>] [--force]
 //        [--device <serial>] [--avd <name>] [--install <apk>]... [--app <package-id>] [--fresh]
 //        [--guard-app <package-id>] [--guard-strict]
-//        [--bit-rate <n>] [--size <WxH>] [--segment-seconds <n>] [--tighten]
+//        [--bit-rate <n>] [--size <WxH>] [--segment-seconds <n>] [--tighten] [--no-show-taps]
 //
 // NAMING: output defaults to `<out>/<flow>-android.mp4`. `--name <basename>` overrides the stem
 // (`<out>/<basename>.mp4`, `<out>/<basename>-tight.mp4`, `<out>/<basename>.json`) so a storyboard
@@ -117,7 +117,7 @@
 // attempt, never resumed mid-way):
 //
 //   PREFLIGHT → DEVICE → [INSTALL/FRESH] → RECORD_START → MAESTRO → RECORD_STOP
-//     → PULL → STITCH/FINALIZE → [TIGHTEN] → SIDECAR → done
+//     → PULL → STITCH/FINALIZE → [SHOW_TAPS] → [TIGHTEN] → SIDECAR → done
 //
 // - PREFLIGHT: verify Node >= 20, resolve adb/maestro/ffmpeg/emulator (PATH first, then
 //   $FILMKIT_* overrides, then grounded fallbacks in lib/tools.mjs), verify the flow file
@@ -152,26 +152,98 @@
 //   screen is in it. Any other unusable segment is real lost footage: the take is stitched from
 //   what survived, reported as truncated through the same channel as a chain abort, and the run
 //   exits non-zero with the file kept. One bad segment never costs the other N-1.
-// - TIGHTEN (opt-in, --tighten): runs after FINALIZE, only if maestro succeeded (a failed flow's
+// - SHOW_TAPS (on by default, skip with `--no-show-taps`): draws a ripple at every touch, burned
+//   into the stitched take with ffmpeg before TIGHTEN ever sees it. Android's own `show_touches`
+//   setting is NOT what does this and cannot be: Maestro injects through UiAutomation, which
+//   never reaches the pointer-spot overlay (verified twice on this emulator — indicator on, taps
+//   injected, nothing drawn). So the taps are recovered after the fact from what `maestro test
+//   --debug-output` wrote; see lib/tap-overlay.mjs for the log formats and the measured lead.
+//   Three numbers make the timing work, all measured on a Pixel 9 Pro XL emulator (API 36)
+//   against a page in Chrome that flashed a white block at known instants:
+//     * ANCHOR. `adb shell screenrecord --verbose` prints "Content area is WxH at offset x=.. y=.."
+//       on stdout as the last thing before it starts capturing, and video time 0.000 is the
+//       instant that line ARRIVES minus 115 ms. Nine runs: 77, 95, 97, 108, 114, 118, 138, 138,
+//       158 ms (a 81 ms spread). SPAWN TIME IS NOT THE ANCHOR — the same nine runs put video zero
+//       227–632 ms after spawn, because a `--size` the encoder refuses costs an extra configure
+//       round trip before capture begins. Spawn + 400 ms is only the fallback for a screenrecord
+//       too old to know `--verbose`, and it says so in the sidecar and on stderr.
+//       The line is only believed if it ARRIVED in time to mean anything: `adb shell` gives the
+//       recorder a line-buffered pty, but a device that block-buffers stdout instead would hand
+//       over the whole of it at exit, which would map every tap to a negative time and drop the
+//       lot in silence. Past ANCHOR_LINE_MAX_LAG_MS the segment falls back to spawn + 400 ms,
+//       says which segment and why on stderr, and records it in `tapSync.offsets[].anchorNote`.
+//       (Those nine were all cold `adb shell` spawns. A segment spawned mid-chain reaches the
+//       same line in ~85 ms, so its `spawnToVideoZeroMs` in the sidecar comes out slightly
+//       NEGATIVE — the constant is a touch generous when the transport is already warm. Measured
+//       end to end it costs nothing that matters: the rings in a five-segment take landed 3, 24
+//       and 29 ms before their rows' press highlights.)
+//     * GEOMETRY. Tap coordinates are device pixels; the recording usually is not. This emulator
+//       cannot configure its AVC encoder at the native 1344x2992 and silently records 720x1280,
+//       inside which the screen occupies a PILLARBOXED 574x1280 at x=73 — so a plain
+//       video/device ratio would put every ring 73 px left of the finger and 7% too high. The
+//       `--verbose` line above states that content rectangle outright and it is what the rings
+//       are mapped through; a fit-and-centre computation is the fallback.
+//     * SEGMENTS. Each segment has its own anchor and its own slot in the stitched timeline (the
+//       concat `duration` directives, see STITCHING), so a tap is placed as its segment's offset
+//       plus its time inside that segment. A tap that lands in a seam — the few hundred ms
+//       between one recorder dying and the next starting — is on no frame at all, and is dropped
+//       with a count rather than drawn somewhere it did not happen. A long press that STARTS
+//       inside a segment and would run past its end is cut at the end for the same reason: the
+//       rest of that press is not in the footage, and a frozen ring painted over the next
+//       segment's picture is a finger that was never there.
+//   A take that was supposed to get indicators and could not exits non-zero rather than handing
+//   back footage that quietly lacks them; `--no-show-taps` is the way to say you meant it. What
+//   "supposed to" means is not the flow text but Maestro's own `commands-*.json` execution
+//   record: a `tapOn` behind a `when:` that never fired did not tap, and must not fail the take.
+//   The burn is abortable: a SIGINT that lands while it is running stops the ffmpeg child (see
+//   lib/tap-overlay.mjs's `signal`) rather than racing it against process.exit, and the take is
+//   still delivered — without rings, since the burn never finished.
+//   When `--tighten` was also asked for, the FINALIZED (pre-burn) file is kept aside under a
+//   dot-name rather than being clobbered by the burn's rename, so TIGHTEN below can run freeze
+//   detection against it instead of the burn's own re-encode noise — see DETECT-FROM in
+//   tighten.mjs's header. It is deleted once TIGHTEN is done with it (or immediately if --tighten
+//   turns out not to run at all, e.g. an interloped take) — unless the run is interrupted first,
+//   in which case whatever is left over is exactly the kind of thing reportKeptFiles-style
+//   leftovers are for.
+//   Every drawn tap also becomes a protected range (`{kind:'tap', start: tSec-0.15, end: tSec+
+//   max(0.5, holdSec+0.45)}`) so tighten's leading-edge clamp cannot cut a tap — and its ring —
+//   out of a long still stretch. Passed straight into the in-process tighten() call AND written
+//   into the sidecar's top-level `timeline` array, so a later standalone `node tighten.mjs <take>`
+//   protects the same taps without needing --tighten to have run here at all.
+// - TIGHTEN (opt-in, --tighten): runs after SHOW_TAPS — over the video with the rings already in
+//   it, never the bare one — and only if maestro succeeded (a failed flow's
 //   partial recording is left as-is for debugging, not tightened). Calls tighten.mjs's
-//   `tighten()` over the finalized .mp4; the raw file is always kept, a `-tight` variant is
-//   written alongside it. A tighten failure is reported but does not fail the overall command —
-//   the raw recording already succeeded by that point.
+//   `tighten()` over the finalized .mp4, passing the pre-burn file as `detectFrom` and every tap
+//   as a protected range when SHOW_TAPS drew rings (see above); without rings this call is
+//   identical to what it was before either feature existed. The raw file is always kept, a
+//   `-tight` variant is written alongside it. A tighten failure is reported but does not fail the
+//   overall command — the raw recording already succeeded by that point.
 // - SIDECAR: `<out>/<name>.json` records what produced the video — a `status` (ok / truncated /
-//   interloper / flow-failed / interrupted / failed), flow path and content hash, argv, device
-//   serial/fingerprint, requested vs. actual geometry, bit rate, every segment's wall duration
-//   and whether it was dropped, the stitch's planned-vs-actual duration check, raw and tightened
-//   durations, any kept temp files, timestamp. It is written on every path from RECORD_START
-//   onward, failures included, so a `demo/raw/` tree stays self-describing months later. A run
+//   interloper / taps-missing / flow-failed / interrupted / failed), flow path and content hash,
+//   argv, device serial/fingerprint, requested vs. actual geometry, bit rate, every segment's
+//   wall duration and whether it was dropped, the stitch's planned-vs-actual duration check, raw
+//   and tightened durations, every tap that was drawn (`taps`, in output pixels and seconds into
+//   the video), whether indicators were drawn at all (`showTaps`) and whether any were owed
+//   (`tapsExpected`), the anchors they were converted against (`tapSync`), any kept temp files,
+//   timestamp. `taps[].tSec` is measured in the take that was written, NOT in the `-tight`
+//   variant — tighten cuts time out from under it. A top-level `clock`/`timeline` pair (see
+//   SHOW_TAPS above) mirrors the web camera's own sidecar shape, so tighten.mjs's sidecar loader
+//   needs no camera-specific branch to protect taps on a standalone run. `tight.detectFrom` /
+//   `tight.detectMode` / `tight.protected` mirror the tighten() result that produced `-tight.mp4`.
+//   It is written on every path from RECORD_START onward, failures included, so a `demo/raw/`
+//   tree stays self-describing months later. A run
 //   that dies in PREFLIGHT or DEVICE writes none — nothing was filmed, so there is nothing to
 //   describe, and an existing sidecar from an earlier take must not be overwritten by a run that
 //   never reached the camera.
 import { spawn } from 'node:child_process';
-import { mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, rm, readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { resolve, join, basename, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { run, runCapture, resolveTool, sleep, fileExists } from './lib/tools.mjs';
+import { run, runCapture, resolveTool, sleep } from './lib/tools.mjs';
+import { valueFor } from './lib/args.mjs';
+import { preflight as preflightChecks, validateNameStem } from './lib/preflight.mjs';
+import { burnTapRipples, filterScriptOption, flowHasTapCommands, parseMaestroTaps } from './lib/tap-overlay.mjs';
 import { tighten } from './tighten.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -193,6 +265,20 @@ const SEGMENT_EMPTY_MAX_WALL_SEC = 3;
 // How far the stitched file may sit from the timeline the concat directives planned before the
 // stitch is called suspect. Seams cost ~0.33s each; 1.5s is well past any plausible seam total.
 const STITCH_DRIFT_TOLERANCE_SEC = 1.5;
+
+// ── SHOW_TAPS timing constants (all measured; see the SHOW_TAPS header) ──────────────────────
+// Video time 0.000 sits this far BEFORE the arrival of screenrecord's "Content area is …" line,
+// which it prints immediately before the capture loop starts. Nine runs: 77–158 ms, median 115.
+const CONTENT_LINE_TO_VIDEO_ZERO_MS = 115;
+// The fallback anchor when that line never came (a screenrecord without `--verbose`). Same nine
+// runs measured spawn → video zero at 227–632 ms, median 409 — hence a warning wherever used.
+const SPAWN_TO_VIDEO_ZERO_MS = 400;
+// `Content area is 574x1280 at offset x=73 y=0` — the pillarbox the rings have to live inside.
+const CONTENT_AREA_RE = /Content area is\s+(\d+)x(\d+)\s+at offset\s+x=(-?\d+)\s+y=(-?\d+)/;
+// Ring size is quoted in dp, so it has to survive both the recording's scale and the device's
+// density. 480 dpi (3×) is this emulator's, and a sane guess for a phone whose density will not
+// be read — being wrong here changes how big the ring is, never where it is.
+const DEFAULT_DENSITY_DPI = 480;
 
 // How often the foreground watchdog asks the device who is on top. Every sample is one `adb
 // shell dumpsys` round trip (~40ms here), so this is cheap enough to run for the whole take and
@@ -217,7 +303,7 @@ const USAGE =
   'usage: node film-android.mjs <flow.yaml> [--out <dir>] [--name <basename>] [--force] ' +
   '[--device <serial>] [--avd <name>] [--install <apk>]... [--app <package-id>] [--fresh] ' +
   '[--guard-app <package-id>] [--guard-strict] ' +
-  '[--bit-rate <n>] [--size <WxH>] [--segment-seconds <n>] [--tighten]';
+  '[--bit-rate <n>] [--size <WxH>] [--segment-seconds <n>] [--tighten] [--no-show-taps]';
 
 function log(msg) {
   console.log(`[film-android] ${msg}`);
@@ -227,16 +313,6 @@ function usageError(msg) {
   console.error(`[film-android] ${msg}`);
   console.error(USAGE);
   process.exit(1);
-}
-
-// A flag that takes a value must not eat the NEXT FLAG as that value. `--out --dry-run` used to
-// set out to "--dry-run" and then film into a directory named after a flag; `--install` with
-// nothing after it used to reach `resolve(undefined)` and print a stack trace.
-function valueFor(argv, i, flag) {
-  const value = argv[i + 1];
-  if (value === undefined) usageError(`${flag} needs a value — nothing followed it`);
-  if (value.startsWith('--')) usageError(`${flag} needs a value, but the next argument is the flag "${value}"`);
-  return value;
 }
 
 function parseArgs(argv) {
@@ -255,45 +331,48 @@ function parseArgs(argv) {
   let size;
   let segmentSeconds = DEFAULT_SEGMENT_SECONDS;
   let doTighten = false;
+  let showTaps = true;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') {
-      out = valueFor(argv, i, '--out');
+      out = valueFor(argv, i, '--out', usageError);
       i++;
     } else if (argv[i] === '--name') {
-      name = valueFor(argv, i, '--name');
+      name = valueFor(argv, i, '--name', usageError);
       i++;
     } else if (argv[i] === '--force') {
       force = true;
     } else if (argv[i] === '--device') {
-      device = valueFor(argv, i, '--device');
+      device = valueFor(argv, i, '--device', usageError);
       i++;
     } else if (argv[i] === '--avd') {
-      avd = valueFor(argv, i, '--avd');
+      avd = valueFor(argv, i, '--avd', usageError);
       i++;
     } else if (argv[i] === '--install') {
-      installs.push(resolve(valueFor(argv, i, '--install')));
+      installs.push(resolve(valueFor(argv, i, '--install', usageError)));
       i++;
     } else if (argv[i] === '--app') {
-      appId = valueFor(argv, i, '--app');
+      appId = valueFor(argv, i, '--app', usageError);
       i++;
     } else if (argv[i] === '--fresh') {
       fresh = true;
     } else if (argv[i] === '--guard-app') {
-      guardApp = valueFor(argv, i, '--guard-app');
+      guardApp = valueFor(argv, i, '--guard-app', usageError);
       i++;
     } else if (argv[i] === '--guard-strict') {
       guardStrict = true;
     } else if (argv[i] === '--bit-rate') {
-      bitRate = String(valueFor(argv, i, '--bit-rate'));
+      bitRate = String(valueFor(argv, i, '--bit-rate', usageError));
       i++;
     } else if (argv[i] === '--size') {
-      size = String(valueFor(argv, i, '--size'));
+      size = String(valueFor(argv, i, '--size', usageError));
       i++;
     } else if (argv[i] === '--segment-seconds') {
-      segmentSeconds = Number(valueFor(argv, i, '--segment-seconds'));
+      segmentSeconds = Number(valueFor(argv, i, '--segment-seconds', usageError));
       i++;
     } else if (argv[i] === '--tighten') {
       doTighten = true;
+    } else if (argv[i] === '--no-show-taps') {
+      showTaps = false;
     } else {
       rest.push(argv[i]);
     }
@@ -322,8 +401,11 @@ function parseArgs(argv) {
     process.exit(1);
   }
   // A name becomes a filename stem in --out and a filename stem on the device; keep it one.
-  if (name !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
-    console.error(`--name must be a bare filename stem — letters, digits, . _ - (got "${name}")`);
+  // Same rule, same words, one copy: lib/preflight.mjs owns it for every camera.
+  try {
+    validateNameStem(name);
+  } catch (err) {
+    console.error(err.message);
     process.exit(1);
   }
   if (!Number.isFinite(segmentSeconds) || segmentSeconds < 5 || segmentSeconds > SEGMENT_SECONDS_CAP) {
@@ -349,28 +431,16 @@ function parseArgs(argv) {
     size,
     segmentSeconds,
     doTighten,
+    showTaps,
   };
 }
 
 // ── PREFLIGHT ───────────────────────────────────────────────────────────────────────────────
 async function preflight(flowPath, plannedOutputs, force) {
-  const [major] = process.versions.node.split('.').map(Number);
-  if (major < 20) {
-    throw new Error(`Node >= 20 required — running under Node ${process.version}`);
-  }
-  if (!(await fileExists(flowPath))) {
-    throw new Error(`flow file not found: ${flowPath}`);
-  }
-  if (!force) {
-    for (const candidate of plannedOutputs) {
-      if (await fileExists(candidate)) {
-        throw new Error(
-          `refusing to overwrite an existing take: ${candidate}\n` +
-            '  pass --name <basename> to film a new one, or --force to overwrite this one.',
-        );
-      }
-    }
-  }
+  // Node version, flow file, and the refusal to clobber an existing take are the same three
+  // checks every camera makes in the same order with the same words — lib/preflight.mjs owns
+  // them. What is left here is the only part that is Android's: which tools have to exist.
+  await preflightChecks(flowPath, plannedOutputs, force);
   // The emulator binary is only needed when we may have to boot one; adb/maestro/ffmpeg always.
   const tools = {};
   for (const name of ['adb', 'maestro', 'ffmpeg']) tools[name] = await resolveTool(name);
@@ -469,6 +539,147 @@ async function deviceFingerprint(adb, deviceId) {
   } catch {
     return null;
   }
+}
+
+// `wm density` reports "Physical density: 480" and, under an override, "Override density: 420".
+// Only the ring's SIZE depends on this, so a device that will not answer costs a ring drawn at
+// the wrong scale, never one drawn in the wrong place.
+async function deviceDensityDpi(adb, deviceId) {
+  try {
+    const stdout = await runCapture(adb, ['-s', deviceId, 'shell', 'wm', 'density']);
+    const override = stdout.match(/Override density:\s*(\d+)/);
+    const physical = stdout.match(/Physical density:\s*(\d+)/);
+    const dpi = Number((override ?? physical)?.[1]);
+    return Number.isFinite(dpi) && dpi > 0 ? dpi : null;
+  } catch {
+    return null;
+  }
+}
+
+// `--verbose` is what prints the "Content area is …" line the tap anchor hangs off, and it has
+// been in screenrecord since v1.0 — but a recorder that rejected the flag would fail EVERY
+// segment, which is a catastrophic way to find out. So ask first: `--help` costs one round trip
+// and the answer decides whether the run gets the good anchor or the fallback one.
+async function screenrecordSupportsVerbose(adb, deviceId) {
+  try {
+    const stdout = await runCapture(adb, ['-s', deviceId, 'shell', 'screenrecord --help 2>&1']);
+    return /--verbose\b/.test(stdout);
+  } catch {
+    return false;
+  }
+}
+
+// ── SHOW_TAPS: where a device pixel lands in the recorded picture ────────────────────────────
+// screenrecord scales the display into the video and CENTRES it, so a video whose aspect does
+// not match the device's has bars, and a ring drawn at (deviceX * videoW/deviceW) sits in one of
+// them. `--verbose` states the content rectangle outright; when it is missing the same
+// fit-and-centre it performs is recomputed here (checked against the real thing on this
+// emulator: 1344x2992 into 720x1280 → 574x1280 at x=73, exactly what screenrecord printed).
+export function contentRect({ contentArea, videoWidth, videoHeight, deviceWidth, deviceHeight }) {
+  if (contentArea) return { ...contentArea, source: 'screenrecord --verbose' };
+  if (!(videoWidth > 0 && videoHeight > 0 && deviceWidth > 0 && deviceHeight > 0)) return null;
+  const scale = Math.min(videoWidth / deviceWidth, videoHeight / deviceHeight);
+  const w = Math.floor(deviceWidth * scale);
+  const h = Math.floor(deviceHeight * scale);
+  return { w, h, x: Math.round((videoWidth - w) / 2), y: Math.round((videoHeight - h) / 2), source: 'fit-and-centre' };
+}
+
+// Wall clock of video time 0.000 for one segment, and how that was arrived at. The anchor is the
+// whole ballgame: get it wrong by a second and every ring in that segment is on the wrong screen.
+//
+// The line is only believed if it arrived when a line printed before the capture loop plausibly
+// could. `adb shell` gives screenrecord a pty, which is line-buffered — that is why the arrival
+// time means anything at all — but a device that block-buffers instead would hand over the whole
+// of stdout when the buffer filled or when the process exited, i.e. up to a whole segment late.
+// Every tap would then map to a negative time and be dropped as "no segment was recording then":
+// silent, total, and indistinguishable from a flow that never tapped. Measured arrivals are
+// 365–746 ms after spawn on a cold `adb shell` and ~85 ms on a warm chained one, so 2 s is far
+// outside anything real and unmistakably inside a buffering failure.
+export const ANCHOR_LINE_MAX_LAG_MS = 2000;
+
+export function segmentAnchor(seg) {
+  const lagMs = seg.contentAreaAt === null || seg.contentAreaAt === undefined ? null : seg.contentAreaAt - seg.startedAt;
+  if (lagMs !== null && lagMs <= ANCHOR_LINE_MAX_LAG_MS) {
+    return {
+      videoZeroWallMs: seg.contentAreaAt - CONTENT_LINE_TO_VIDEO_ZERO_MS,
+      source: 'screenrecord "Content area" line',
+      note: null,
+    };
+  }
+  return {
+    videoZeroWallMs: seg.startedAt + SPAWN_TO_VIDEO_ZERO_MS,
+    source: `spawn + ${SPAWN_TO_VIDEO_ZERO_MS}ms`,
+    note:
+      lagMs === null
+        ? 'screenrecord printed no "Content area" line'
+        : `screenrecord's "Content area" line arrived ${lagMs}ms after spawn, past the ${ANCHOR_LINE_MAX_LAG_MS}ms ` +
+          'this device could plausibly take to start capturing — its stdout is buffered, so the line says nothing ' +
+          'about when video time 0 was',
+  };
+}
+
+/**
+ * One line for `tapSync.anchor` describing what the segments really hung off. Before the timeline
+ * exists (a run that never got that far) the only honest answer is what the recorder was asked
+ * for, which is what `recorderVerbose` carries.
+ */
+export function anchorSummary(timeline, recorderVerbose) {
+  if (timeline.length === 0) {
+    return recorderVerbose ? 'screenrecord "Content area" line (no segment reached)' : `spawn + ${SPAWN_TO_VIDEO_ZERO_MS}ms (no --verbose)`;
+  }
+  const sources = [...new Set(timeline.map((slot) => slot.anchorSource))];
+  if (sources.length === 1) return sources[0];
+  const fellBack = timeline.filter((slot) => slot.anchorNote).map((slot) => slot.tag);
+  return `mixed: ${sources.join(' / ')} — ${fellBack.join(', ')} fell back`;
+}
+
+/**
+ * Wall-clock touches → (x, y, tSec) in the stitched video.
+ *
+ * `timeline` is one entry per segment that made it into the file, in order: its anchor, the slot
+ * it occupies (`offsetSec`, and `spanSec` = null for the last one, which plays to the end), and
+ * its tag for the diagnostics. A tap belongs to the segment whose window contains it; a tap that
+ * belongs to none happened in a seam or outside the recording, where there is no frame to draw
+ * on, and is reported rather than nudged onto the nearest one.
+ */
+export function mapTapsToVideo({ taps, timeline, rect, deviceWidth, deviceHeight, lastSec }) {
+  const scaleX = rect.w / deviceWidth;
+  const scaleY = rect.h / deviceHeight;
+  const drawn = [];
+  const dropped = [];
+  const clamped = [];
+  for (const tap of taps) {
+    let placed = null;
+    for (const slot of timeline) {
+      const intoSec = (tap.wallMs - slot.videoZeroWallMs) / 1000;
+      if (intoSec < 0) continue;
+      if (slot.spanSec !== null && intoSec > slot.spanSec) continue;
+      placed = { slot, tSec: slot.offsetSec + intoSec };
+      break;
+    }
+    if (placed === null || placed.tSec > lastSec) {
+      dropped.push({ tap, reason: placed === null ? 'no segment was recording then' : 'past the end of the video' });
+      continue;
+    }
+    // A 3-second hold that starts a second before a seam does not continue across it: the rest of
+    // that press happened while no recorder was running, and the next segment's footage is of
+    // something else. Painting a frozen ring over it would be inventing a finger. The hold is cut
+    // at its own segment's end, where the ripple then breaks — which is also what the footage
+    // shows, since the seam is where the picture stops.
+    const slotEndSec = placed.slot.spanSec === null ? lastSec : placed.slot.offsetSec + placed.slot.spanSec;
+    const room = Math.max(0, Math.min(slotEndSec, lastSec) - placed.tSec);
+    const wanted = tap.holdSec || 0;
+    const holdSec = Math.min(wanted, room);
+    if (wanted > holdSec + 0.001) clamped.push({ tap, wanted, holdSec, segment: placed.slot.tag });
+    drawn.push({
+      x: rect.x + tap.xPt * scaleX,
+      y: rect.y + tap.yPt * scaleY,
+      tSec: placed.tSec,
+      holdSec,
+      segment: placed.slot.tag,
+    });
+  }
+  return { drawn, dropped, clamped };
 }
 
 // ── FOREGROUND WATCHDOG: who is actually on screen while the camera rolls ────────────────────
@@ -612,7 +823,7 @@ function startForegroundWatch(adb, deviceId, { guardedApp, startedAt, onInterlop
 // authoritative record of the run — every seam, every wall duration, every recorder warning.
 const segTag = (index) => `seg${String(index).padStart(3, '0')}`;
 
-function startSegmentChain(adb, deviceId, { deviceBase, bitRate, size, segmentSeconds }) {
+function startSegmentChain(adb, deviceId, { deviceBase, bitRate, size, segmentSeconds, verbose }) {
   const segments = [];
   let stopped = false;
   let abortReason = null;
@@ -626,13 +837,45 @@ function startSegmentChain(adb, deviceId, { deviceBase, bitRate, size, segmentSe
       [
         '-s', deviceId, 'shell', 'screenrecord',
         '--bit-rate', bitRate,
+        // Costs nothing on the recording and buys the tap anchor and the exact content
+        // rectangle. See the SHOW_TAPS header; the flag is probed for before it is used.
+        ...(verbose ? ['--verbose'] : []),
         ...(size ? ['--size', size] : []),
         '--time-limit', String(segmentSeconds),
         devicePath,
       ],
-      { stdio: ['ignore', 'ignore', 'pipe'] },
+      { stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    const seg = { index, tag, devicePath, startedAt, wallSec: null, exitCode: null, signal: null, stderr: [] };
+    const seg = {
+      index, tag, devicePath, startedAt, wallSec: null, exitCode: null, signal: null,
+      stderr: [], stdout: [], contentArea: null, contentAreaAt: null,
+    };
+
+    // screenrecord's --verbose narration goes to STDOUT (its diagnostics go to stderr, below).
+    // Only the content-area line is echoed — the rest is provenance, kept in the sidecar. The
+    // ARRIVAL TIME of that line, not the line itself, is what anchors this segment's tap times,
+    // so it is stamped the moment the chunk lands rather than parsed out of anything on-device.
+    let pendingOut = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      const at = Date.now();
+      pendingOut += chunk;
+      const lines = pendingOut.split(/\r?\n/);
+      pendingOut = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        seg.stdout.push(line.trim());
+        const area = CONTENT_AREA_RE.exec(line);
+        if (area && seg.contentAreaAt === null) {
+          seg.contentArea = { w: Number(area[1]), h: Number(area[2]), x: Number(area[3]), y: Number(area[4]) };
+          seg.contentAreaAt = at;
+          console.log(
+            `[screenrecord] ${tag}: content area ${seg.contentArea.w}x${seg.contentArea.h} ` +
+              `at (${seg.contentArea.x},${seg.contentArea.y})`,
+          );
+        }
+      }
+    });
 
     // screenrecord's own diagnostics — "unable to configure video/avc codec at <W>x<H>
     // (err=-22)" followed by a SILENT downscale — arrive on the remote stderr, which adb keeps
@@ -1001,6 +1244,118 @@ export function assessStitch(stitch, finalProbe) {
   };
 }
 
+// ── SHOW_TAPS: recover the touches and burn a ripple at each one ─────────────────────────────
+// One job with one honest answer: what was drawn, `null` if the logs held no touch at all, or a
+// throw with a reason the caller can print. It never half-writes — the burn goes to a dot-file
+// and only replaces the take once ffmpeg has exited 0.
+//
+// `keepPreBurn` (only true under `--tighten`) additionally preserves the FINALIZED, pre-burn file
+// under a dot-name next to the output rather than letting the burn's rename clobber it — see
+// DETECT-FROM in tighten.mjs's header for why: freeze detection run against the burned file
+// (fresh quantization noise on every frame) flips tighten out of exact mode into the -60dB
+// threshold, and measured moving freeze boundaries by seconds on real Android footage. The rename
+// dance below (out -> pre-burn dot-file -> burn -> rename back) costs no extra copy: it is the
+// same two renames the plain burn already does, just with the source file kept under a second
+// name instead of being overwritten. On any failure (including an aborted burn — see `signal`)
+// the original is renamed back over the output path, so the take is delivered without rings
+// exactly as it always was; `result.preBurnPath` is null whenever nothing was set aside.
+async function drawTaps({ ffmpeg, videoPath, debugDir, timeline, videoSize, densityDpi, lastSec, bitRate, keepPreBurn, signal }) {
+  const parsed = await parseMaestroTaps({ debugDir, nearEpoch: timeline[0]?.videoZeroWallMs ?? Date.now() });
+  for (const warning of parsed.warnings) log(`⚠️  ${warning}`);
+  // Nothing to draw is not an error HERE — a flow that never taps is a normal flow. Whether it
+  // is an error at all is main()'s call, because only main() knows if any tap command ran.
+  if (parsed.taps.length === 0) return null;
+  if (!parsed.widthPx || !parsed.heightPx) {
+    throw new Error("maestro.log has no 'Got device info: DeviceInfo(...)' line, so taps cannot be placed in the picture");
+  }
+  const [videoWidth, videoHeight] = (videoSize ?? '').split('x').map(Number);
+  const rect = contentRect({
+    contentArea: timeline[0]?.contentArea ?? null,
+    videoWidth,
+    videoHeight,
+    // Maestro's own idea of the device is what its coordinates are in, so it is the denominator
+    // even if `wm size` disagrees (a rotation mid-take would break far more than the rings).
+    deviceWidth: parsed.widthPx,
+    deviceHeight: parsed.heightPx,
+  });
+  if (!rect) throw new Error(`cannot map taps into a ${videoSize ?? 'unknown'} video from a ${parsed.widthPx}x${parsed.heightPx} device`);
+
+  const { drawn, dropped, clamped } = mapTapsToVideo({
+    taps: parsed.taps,
+    timeline,
+    rect,
+    deviceWidth: parsed.widthPx,
+    deviceHeight: parsed.heightPx,
+    lastSec,
+  });
+  for (const cut of clamped) {
+    log(
+      `⚠️  a ${cut.wanted.toFixed(1)}s press ran past the end of ${cut.segment} — its ring is held for ` +
+        `${cut.holdSec.toFixed(2)}s instead, because the rest of that press is not in the footage`,
+    );
+  }
+  if (dropped.length > 0) {
+    log(
+      `⚠️  ${dropped.length} tap(s) landed where nothing was filmed (${[...new Set(dropped.map((d) => d.reason))].join('; ')}) ` +
+        'and were not drawn',
+    );
+  }
+  if (drawn.length === 0) throw new Error(`all ${parsed.taps.length} logged tap(s) fell outside the recorded footage`);
+
+  // A 22dp radius, through the recording's own scale — so the ring is the same size relative to
+  // the screen whether the take is native, downscaled by a refusing encoder, or pinned by --size.
+  const scale = (rect.w / parsed.widthPx) * ((densityDpi ?? DEFAULT_DENSITY_DPI) / 160);
+  const tmpPath = join(dirname(videoPath), `.${basename(videoPath, '.mp4')}.taps.mp4`);
+  const preBurnPath = keepPreBurn ? join(dirname(videoPath), `.${basename(videoPath, '.mp4')}.pre-taps.mp4`) : null;
+  if (preBurnPath) await rename(videoPath, preBurnPath);
+  let result;
+  try {
+    result = await burnTapRipples({
+      inPath: preBurnPath ?? videoPath,
+      outPath: tmpPath,
+      taps: drawn,
+      ffmpegPath: ffmpeg,
+      // Stay at the bit rate the take was recorded at: this is a re-encode of a screen recording,
+      // and the tap-overlay default (12M) would triple the size of a 720x1280 file for nothing.
+      style: { scale, codec: 'h264', videoBitrate: bitRate },
+      signal,
+    });
+  } catch (err) {
+    await rm(tmpPath, { force: true });
+    // Put the pre-burn file back where the take is expected to live — an abort or an encode
+    // failure both mean "deliver the take without rings", the same outcome as if keepPreBurn had
+    // never been asked for.
+    if (preBurnPath) await rename(preBurnPath, videoPath).catch(() => {});
+    throw err;
+  }
+  await rename(tmpPath, videoPath);
+  return {
+    ...result,
+    taps: drawn,
+    dropped: dropped.length,
+    clamped: clamped.length,
+    rect,
+    scale,
+    source: parsed.source,
+    parsedCount: parsed.taps.length,
+    preBurnPath,
+  };
+}
+
+// ── PROTECT: one range per drawn tap, so tighten's leading-edge clamp cannot cut a tap (and its
+// ring) that lands late in a long still stretch. Widened -0.15s before / max(0.5s, hold + 0.45s)
+// after: enough slack either side for the anchor's own measured lead/jitter (see SHOW_TAPS above)
+// without protecting so much that a genuinely dead stretch around the tap survives uncut. These
+// numbers are the spec's, not remeasured here — the anchors that place `tSec` already carry their
+// own measured error bars.
+function tapProtectRanges(taps) {
+  return taps.map((t) => ({
+    kind: 'tap',
+    start: t.tSec - 0.15,
+    end: t.tSec + Math.max(0.5, (t.holdSec ?? 0) + 0.45),
+  }));
+}
+
 async function sha256(path) {
   return createHash('sha256').update(await readFile(path)).digest('hex');
 }
@@ -1009,7 +1364,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const {
     flowArg, outDir, name, force, device: requestedDevice, avd, installs, appId, fresh,
-    guardedApp, guardStrict, bitRate, size, segmentSeconds, doTighten,
+    guardedApp, guardStrict, bitRate, size, segmentSeconds, doTighten, showTaps: showTapsRequested,
   } = args;
   const flowPath = resolve(flowArg);
   const outName = name ?? `${basename(flowPath, extname(flowPath))}-android`;
@@ -1031,9 +1386,27 @@ async function main() {
   let deviceId;
   let nativeSize = null;
   let guardPreflight = null;
+  // What SHOW_TAPS needs off the device before the camera rolls: the density the ring is sized
+  // in, and whether this screenrecord knows `--verbose` (which is what anchors the ring times).
+  let densityDpi = null;
+  let recorderVerbose = false;
   try {
     deviceId = await ensureDevice(adb, requestedDevice, avd ?? process.env.FILMKIT_ANDROID_AVD);
     nativeSize = await deviceNativeSize(adb, deviceId);
+    if (showTapsRequested) {
+      // Whether this ffmpeg can be handed a filter graph at all, asked BEFORE the camera rolls:
+      // the burn is the last step of the run, and finding out there that the graph cannot be
+      // delivered would cost the whole take. The answer is cached for the burn itself.
+      await filterScriptOption(ffmpeg);
+      densityDpi = await deviceDensityDpi(adb, deviceId);
+      recorderVerbose = await screenrecordSupportsVerbose(adb, deviceId);
+      if (!recorderVerbose) {
+        console.error(
+          `[film-android] ⚠️  ${deviceId}'s screenrecord does not take --verbose, so tap indicators lose their ` +
+            `anchor and fall back to a measured ${SPAWN_TO_VIDEO_ZERO_MS}ms after spawn — expect them up to ~0.2s off.`,
+        );
+      }
+    }
     for (const apk of installs) {
       log(`installing ${apk}...`);
       await run(adb, ['-s', deviceId, 'install', '-r', apk]);
@@ -1072,13 +1445,18 @@ async function main() {
   // From here on, a recorder process may exist on the device — every exit path below goes
   // through harvest(), whether the flow succeeds, throws, or is interrupted.
   const deviceBase = `filmkit-${outName.replace(/[^A-Za-z0-9._-]/g, '_')}`;
+  // Dot-prefixed so `ls` hides it: Maestro's own debugging spill (logs, a command-by-command
+  // execution record, a screenshot per warned step). SHOW_TAPS reads the touches out of it, and
+  // it is kept only when something went wrong and there is something to look at.
+  const debugDir = join(outDir, `.${outName}.maestro-debug`);
+  await rm(debugDir, { recursive: true, force: true }); // never read a previous take's taps
   await run(adb, ['-s', deviceId, 'shell', `rm -f ${DEVICE_DIR}/${deviceBase}-seg*.mp4`]).catch(() => {}); // stale segments from a crashed run
   log(
     `starting screen recording${size ? ` at ${size}` : ` at native resolution${nativeSize ? ` (${nativeSize})` : ''}`}` +
       `, ${segmentSeconds}s per segment...`,
   );
   const recordingStartedAt = Date.now();
-  const chain = startSegmentChain(adb, deviceId, { deviceBase, bitRate, size, segmentSeconds });
+  const chain = startSegmentChain(adb, deviceId, { deviceBase, bitRate, size, segmentSeconds, verbose: recorderVerbose });
   const segments = chain.segments;
 
   let maestroChild = null; // held so --guard-strict can cut the flow short
@@ -1112,6 +1490,27 @@ async function main() {
   const tempFiles = []; // local `.<name>.segNNN.mp4` copies; kept, and named, whenever anything went wrong
   const deviceLeftovers = []; // on-device segment files deliberately not deleted
 
+  // SHOW_TAPS state. `timeline` is filled in by harvest() — one slot per segment that made it
+  // into the stitched file, which is what turns a tap's wall clock into a time in the video.
+  let timeline = [];
+  let tapResult = null;
+  let tapError = null; // something went wrong drawing them — always worth saying
+  let noTapsFound = false; // the logs simply held no touch — only news if a tap command ran
+  let tapsExpected = false; // …which is Maestro's own execution record's business, after the run
+  let debugKept = showTapsRequested; // flipped once the run succeeds and the spill is deleted
+  // One protected range per drawn tap (see tapProtectRanges below), filled in once tapResult is
+  // known. Declared here (not where it is assigned) so writeSidecar's closure — which a harvest()
+  // failure can invoke before SHOW_TAPS ever runs — always finds an initialized value rather than
+  // tripping a temporal-dead-zone ReferenceError on a `const` it raced.
+  let tapProtect = [];
+  // Burn-abort state: whether drawTaps' ffmpeg is currently running, the controller SIGINT uses
+  // to stop it, and the in-flight promise SIGINT awaits before writing the sidecar and exiting —
+  // so a Ctrl-C mid-burn tears the encoder down deterministically instead of racing process.exit
+  // against whatever ffmpeg happens to be doing.
+  let burning = false;
+  let burnAbortController = null;
+  let pendingBurn = null;
+
   const wallTotalSec = () => segments.reduce((sum, seg) => sum + (seg.wallSec ?? 0), 0);
   const truncationReason = () => [chain.abortReason, lossReason].filter(Boolean).join('; ') || null;
   const interloped = () => (guard?.interlopers.length ?? 0) > 0;
@@ -1127,12 +1526,26 @@ async function main() {
   const writeSidecar = async ({ status, error = null, finalProbe = null, stitch = null, tightResult = null }) => {
     const payload = {
       tool: 'film-android.mjs',
-      status, // ok | truncated | interloper | flow-failed | interrupted | failed
+      status, // ok | truncated | interloper | taps-missing | flow-failed | interrupted | failed
       error,
       filmedAt: new Date().toISOString(),
       argv: process.argv.slice(2),
+      // tighten.mjs reads a top-level `timeline` array off this file as its protected ranges (the
+      // same mechanism the web camera's sidecar uses for caption/pause holds — see PROTECTED
+      // RANGES in tighten.mjs's header), so a standalone `node tighten.mjs <take>` protects every
+      // drawn tap automatically, with no --tighten flag or in-process call required. `clock:
+      // "frame"` because tSec is measured against the recording's own timeline (segment offset +
+      // anchor), not a wall clock running alongside it, so it needs no drift margin — the -0.15s /
+      // +0.45s padding in tapProtectRanges already covers the anchor's own measured slop.
+      clock: 'frame',
+      timeline: tapProtect,
       flow: { path: flowPath, sha256: await sha256(flowPath).catch(() => null) },
-      device: { serial: deviceId, nativeSize, fingerprint: await deviceFingerprint(adb, deviceId) },
+      device: {
+        serial: deviceId,
+        nativeSize,
+        densityDpi,
+        fingerprint: await deviceFingerprint(adb, deviceId),
+      },
       recording: {
         requestedSize: size ?? null,
         actualSize: finalProbe?.size ?? null,
@@ -1158,6 +1571,9 @@ async function main() {
           dropped: Boolean(seg.dropError),
           dropReason: seg.dropError ?? null,
           stderr: seg.stderr,
+          // screenrecord's --verbose narration: the geometry it settled on, and the content
+          // rectangle the tap indicators were mapped through.
+          stdout: seg.stdout ?? [],
         })),
       },
       // Who owned the screen, and what the guard made of it. `foreground` is one row per CHANGE,
@@ -1176,9 +1592,64 @@ async function main() {
             abortedAtSec: abortedByGuard?.atSec ?? null,
           }
         : null,
-      output: { path: outPath, durationSec: finalProbe?.durationSec ?? null },
+      // What the indicators did, and against what clocks. Every `tSec` below is (the tap's wall
+      // clock − its segment's `videoZeroWallMs`) + that segment's offset in the stitched timeline.
+      showTaps: Boolean(tapResult),
+      showTapsRequested: showTapsRequested,
+      tapsExpected,
+      taps: tapResult
+        ? tapResult.taps.map((t) => ({
+            x: Math.round(t.x),
+            y: Math.round(t.y),
+            tSec: Number(t.tSec.toFixed(3)),
+            segment: t.segment,
+            ...(t.holdSec ? { holdSec: t.holdSec } : {}),
+          }))
+        : [],
+      // …and null, not a set of anchors nobody used, when `--no-show-taps` asked for none.
+      tapSync: !showTapsRequested ? null : {
+        // What the segments ACTUALLY anchored on, not what the `--help` probe hoped for: the line
+        // can be supported, printed, and still arrive too late to mean anything (see
+        // segmentAnchor). A mixed take names both, because then some rings are tighter than others.
+        anchor: anchorSummary(timeline, recorderVerbose),
+        offsets: timeline.map((slot) => ({
+          segment: slot.tag,
+          videoZeroWallMs: slot.videoZeroWallMs,
+          // How late capture actually began. Logged because it is the number that makes anchoring
+          // on spawn wrong: 227–632ms on cold spawns, and slightly negative on a warm chained
+          // segment, where the anchor's constant is a little generous (see the ANCHOR header).
+          spawnToVideoZeroMs: slot.videoZeroWallMs - slot.startedAt,
+          anchorSource: slot.anchorSource,
+          anchorNote: slot.anchorNote ?? null,
+          offsetSec: Number(slot.offsetSec.toFixed(3)),
+          spanSec: slot.spanSec === null ? null : Number(slot.spanSec.toFixed(3)),
+          contentArea: slot.contentArea,
+        })),
+        source: tapResult?.source ?? null,
+        scale: tapResult?.scale ?? null,
+        contentRect: tapResult?.rect ?? null,
+        droppedTaps: tapResult?.dropped ?? 0,
+        clampedHolds: tapResult?.clamped ?? 0,
+        ffmpeg: tapResult ? { version: tapResult.ffmpegVersion ?? null, filterOption: tapResult.filterOption ?? null } : null,
+        // A Ctrl-C exits before SHOW_TAPS ever runs — say that outright rather than leaving an
+        // empty `taps` array to be read as "this take had none".
+        error:
+          tapError ??
+          (noTapsFound
+            ? 'no touch was logged by maestro'
+            : showTapsRequested && !tapResult && status === 'interrupted'
+              ? 'interrupted before the indicators were drawn'
+              : null),
+      },
+      output: {
+        path: outPath,
+        durationSec: finalProbe?.durationSec ?? null,
+        fps: tapResult?.fps ?? null,
+        encoder: tapResult?.encoder ?? null,
+      },
       tight: tightResult ?? null,
       flowSucceeded: !maestroError,
+      debugOutput: debugKept ? debugDir : null,
       keptFiles: { local: [...tempFiles], device: deviceLeftovers.map((p) => `${deviceId}:${p}`) },
     };
     await writeFile(sidecarPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
@@ -1313,6 +1784,29 @@ async function main() {
         };
       }
 
+      // Where each surviving segment sits in the finished file, and what wall clock its own
+      // frame 0 was. This is built from the SAME numbers the concat directives were built from,
+      // deliberately: if the rings are placed against a different timeline than the demuxer laid
+      // down, they drift by exactly the difference. The last segment's slot has no span — it
+      // plays out to the end of the video, and the mapper clamps to the file's real duration.
+      timeline = usable.map(({ seg }, i) => {
+        const { videoZeroWallMs, source, note } = segmentAnchor(seg);
+        // A segment that fell back is a segment whose rings are ~0.2s looser, and the operator
+        // has to be told which one and why — silence here is how a buffered stdout would look
+        // exactly like a device with no taps.
+        if (note) console.error(`[film-android] ⚠️  ${seg.tag}: ${note} — anchoring its taps on ${source} instead.`);
+        return {
+          tag: seg.tag,
+          startedAt: seg.startedAt,
+          contentArea: seg.contentArea,
+          offsetSec: usable.slice(0, i).reduce((sum, { seg: prev }) => sum + (prev.timelineSec ?? 0), 0),
+          spanSec: i === usable.length - 1 ? null : (seg.timelineSec ?? null),
+          videoZeroWallMs,
+          anchorSource: source,
+          anchorNote: note,
+        };
+      });
+
       const finalProbe = await probeVideo(ffmpeg, outPath);
 
       // The stitch is only believable if the file agrees with the timeline the directives asked
@@ -1375,6 +1869,15 @@ async function main() {
   // on-device recorder keeps running, the segments are never pulled, and the take is gone. With
   // it, Ctrl-C is just another way to reach harvest() — stop, pull, stitch, sidecar — and exit
   // non-zero (130, the shell's convention for it).
+  //
+  // A second window this same handler has to cover: SHOW_TAPS's burn, which runs AFTER harvest()
+  // has already completed on the normal path. `burning` says whether that ffmpeg is live right
+  // now; if it is, `burnAbortController` is what stops it (SIGTERM, escalating to SIGKILL — see
+  // burnTapRipples) instead of leaving it to race process.exit() or rely on the terminal having
+  // delivered SIGINT to the whole process group by other means. `pendingBurn` is awaited (its
+  // rejection swallowed — drawTaps' own cleanup already said what needed saying) before touching
+  // the sidecar or exiting, so the encoder is fully torn down and its partial output already
+  // removed by the time this process disappears, not merely asked to be.
   process.on('SIGINT', () => {
     if (interrupted) {
       console.error('[film-android] still saving what was filmed — a second Ctrl-C will not make it faster.');
@@ -1382,7 +1885,13 @@ async function main() {
     }
     interrupted = true;
     console.error('\n[film-android] SIGINT — stopping the recorder and saving what was filmed so far...');
-    runHarvest()
+    const abortingBurn = burning;
+    if (abortingBurn) {
+      console.error('[film-android] a tap-indicator burn is in progress — stopping the encoder...');
+      burnAbortController?.abort();
+    }
+    (abortingBurn && pendingBurn ? pendingBurn.catch(() => {}) : Promise.resolve())
+      .then(() => runHarvest())
       .then(async (outcome) => {
         reportForeground(); // an interloper may well be WHY the operator hit Ctrl-C
         if (outcome.ok) {
@@ -1408,7 +1917,9 @@ async function main() {
     // Spawned here rather than through run() because --guard-strict needs the child itself: the
     // `maestro` launcher ends in `exec java`, so this pid IS the JVM and a SIGINT lands on it.
     // Same stdio and the same error shape run() produces, so nothing downstream can tell.
-    const argsList = ['--device', deviceId, 'test', flowPath];
+    // --debug-output is where the tap times come from. Always on when indicators are wanted,
+    // even if this flow file shows no tap commands: an included flow can still tap.
+    const argsList = ['--device', deviceId, 'test', ...(showTapsRequested ? ['--debug-output', debugDir] : []), flowPath];
     await new Promise((resolveFlow, rejectFlow) => {
       maestroChild = spawn(maestro, argsList, { stdio: 'inherit' });
       maestroChild.on('error', (err) =>
@@ -1431,6 +1942,78 @@ async function main() {
   reportForeground();
   if (!outcome.ok) process.exit(1); // harvest already reported and wrote the sidecar
 
+  // ── SHOW_TAPS. Over the stitched take, before tighten touches it. This runs even when the
+  // flow failed: the touches that DID land belong in the partial recording too. Only the policy
+  // below is conditional on the flow having succeeded.
+  if (showTapsRequested) {
+    // Not "does the flow file contain a tapOn" — Maestro's own execution record, which knows the
+    // difference between a tap command and a tap command behind a `when:` that never fired.
+    tapsExpected = flowHasTapCommands(await readFile(flowPath, 'utf8').catch(() => ''), debugDir);
+    try {
+      burning = true;
+      burnAbortController = new AbortController();
+      // keepPreBurn only when --tighten will actually want the pre-burn file (see DETECT-FROM);
+      // burning=true/aborter/pendingBurn are set contiguously (no `await` between them) so the
+      // SIGINT handler above can never observe `burning` true while `pendingBurn` is still null.
+      pendingBurn = drawTaps({
+        ffmpeg,
+        videoPath: outPath,
+        debugDir,
+        timeline,
+        videoSize: outcome.finalProbe?.size ?? null,
+        densityDpi,
+        lastSec: outcome.finalProbe?.durationSec ?? Infinity,
+        bitRate,
+        keepPreBurn: doTighten,
+        signal: burnAbortController.signal,
+      });
+      tapResult = await pendingBurn;
+      if (tapResult === null) {
+        noTapsFound = true;
+      } else {
+        log(
+          `drew ${tapResult.taps.length} tap indicator(s) at ${tapResult.fps}fps ` +
+            `(${tapResult.encoder}, ${tapResult.elapsedSec.toFixed(1)}s)`,
+        );
+      }
+    } catch (err) {
+      tapError = err.message;
+    } finally {
+      burning = false;
+      burnAbortController = null;
+      pendingBurn = null;
+    }
+  }
+  // A Ctrl-C that landed mid-burn is handled entirely by the SIGINT handler (abort, harvest,
+  // sidecar, exit 130) — main() must not also report a tap failure and exit(1) for the very
+  // AbortError that handler is already racing to clean up after.
+  if (interrupted) return;
+
+  // Now that tapResult is known, fill in the protected ranges every sidecar write below carries
+  // in its top-level `timeline` array — which is what lets a standalone `node tighten.mjs <take>`
+  // protect taps without --tighten ever having run in this process.
+  tapProtect = tapResult ? tapProtectRanges(tapResult.taps) : [];
+
+  // A flow that tapped and a take with no rings on it is exactly the thing that must not pass
+  // quietly. A flow that FAILED is already exiting non-zero with its own error and half of it
+  // never ran, so missing rings there are a symptom, not the news — that check comes after this
+  // one. A flow in which no tap command ran skips all of it in silence: there was nothing to draw.
+  if ((tapError !== null || noTapsFound) && tapsExpected && !maestroError) {
+    const why = tapError ?? 'maestro logged no touch at all';
+    console.error(`\n[film-android] tap indicators could not be derived for "${outName}" — ${why}`);
+    console.error(`[film-android]   maestro debug output: ${debugDir}`);
+    console.error(`[film-android]   the recording was still written, WITHOUT indicators: ${outPath}`);
+    console.error('[film-android]   pass --no-show-taps to film without them on purpose.');
+    await writeSidecarSafely({
+      status: 'taps-missing',
+      error: `tap indicators could not be derived: ${why}`,
+      finalProbe: outcome.finalProbe,
+      stitch: outcome.stitch,
+    });
+    process.exit(1);
+  }
+  if (tapError) log(`⚠️  no tap indicators drawn — ${tapError}`);
+
   if (maestroError) {
     // An interloper outranks a flow failure as the diagnosis, because in --guard-strict it CAUSED
     // it — the flow "failed" only in the sense that the guard shot it. Both reasons are kept.
@@ -1446,8 +2029,18 @@ async function main() {
       console.error(`\n[film-android] maestro flow "${outName}" failed: ${maestroError.message}`);
     }
     console.error(`[film-android] the partial recording was still saved to ${outPath} for debugging.`);
+    if (debugKept) console.error(`[film-android] maestro's own debug output (logs, failure screenshots): ${debugDir}`);
     process.exit(1);
   }
+
+  // Nothing went wrong, so Maestro's spill is noise — it only earns its keep on a failure. The
+  // rings are already burned in by here, so nothing downstream still needs the logs.
+  await rm(debugDir, { recursive: true, force: true });
+  debugKept = false;
+
+  // The delivered file is the one with the rings in it, so the duration the sidecar quotes has to
+  // be that file's, not the pre-burn probe's.
+  if (tapResult) outcome.finalProbe = await probeVideo(ffmpeg, outPath);
 
   console.log(
     `\n[film-android] Demo video written: ${outPath}` +
@@ -1463,11 +2056,23 @@ async function main() {
       `[film-android] --tighten skipped — this take is suspect. If it is usable after all: ` +
         `node tighten.mjs ${outPath}`,
     );
+    // Nothing is going to read this — tighten was never called — so it must not linger as an
+    // unexplained dot-file forever.
+    if (tapResult?.preBurnPath) await rm(tapResult.preBurnPath, { force: true });
   } else if (doTighten) {
     try {
-      const result = await tighten(outPath);
+      const result = await tighten(outPath, {
+        // Rings were burned in, so freeze detection against outPath would be reading the burn's
+        // own quantization noise, not the recorder's — see DETECT-FROM in tighten.mjs's header.
+        // Without rings (no taps, or --no-show-taps) this stays undefined and tighten runs exactly
+        // as it did before this feature existed.
+        ...(tapResult?.preBurnPath ? { detectFrom: tapResult.preBurnPath } : {}),
+        // The tap ranges are already in memory — no reason to make tighten re-read them off the
+        // sidecar this process is about to write.
+        ...(tapProtect.length > 0 ? { protect: tapProtect, protectMarginSec: 0, sidecar: false } : {}),
+      });
       if (result.skipped) {
-        log(`already tight (no static stretches found) — kept raw only: ${outPath}`);
+        log(`already tight (${result.skipDetail || 'no static stretches found'}) — kept raw only: ${outPath}`);
       } else {
         log(
           `tightened ${result.totalDuration.toFixed(2)}s -> ${result.outDuration.toFixed(2)}s ` +
@@ -1483,10 +2088,19 @@ async function main() {
           plannedDurationSec: Number(result.outDuration.toFixed(3)),
           cuts: result.cuts,
           removedSec: Number(result.removedSec.toFixed(3)),
+          detectFrom: result.detectFrom ?? null,
+          detectMode: result.detectMode,
+          protected: result.protected,
         };
       }
     } catch (err) {
       console.error(`[film-android] --tighten skipped — ${err.message}`);
+    } finally {
+      // The pre-burn file only ever existed to feed --detect-from above; tighten has now either
+      // used it or failed trying, and either way there is nothing left to do with it. "Unless the
+      // run is interrupted" needs no code here: a SIGINT during this very call exits the process
+      // before this line is ever reached, which is what leaves it behind on purpose.
+      if (tapResult?.preBurnPath) await rm(tapResult.preBurnPath, { force: true });
     }
   }
 
