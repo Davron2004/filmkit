@@ -5,11 +5,17 @@
 //   node film-web.mjs examples/web/tip-demo.demo.mjs --tighten
 //
 // Selectors: the fixture renders `<label><span>{label}</span><input/></label>` — no testids,
-// so we match on the label text. The computed rows are targeted by filtering on their own
-// label text, never by position.
+// so we match on the label text with `:has-text("…")`, never by position. The computed rows
+// do have ids, so they are targeted by id. Every target here is a plain selector STRING, which
+// is what both cameras understand — `--browser ego` cannot take a Playwright Locator.
+import { fileURLToPath } from 'node:url';
+
 export default async function tipDemo({ stage }) {
   // open() accepts an http(s) URL or a local file path. Here we resolve the sibling fixture.
-  await stage.open(new URL('./fixture.html', import.meta.url).pathname);
+  // fileURLToPath, not `.pathname`: a URL's pathname is percent-ENCODED, so a repo checked out
+  // under a directory with a space in it yields ".../my%20repo/fixture.html", which is not a
+  // path any filesystem has. This is the correct way to turn an import.meta.url into a path.
+  await stage.open(fileURLToPath(new URL('./fixture.html', import.meta.url)));
 
   await stage.caption('Meet Tip Splitter — split any bill in seconds.');
   await stage.pause(2600);
@@ -32,7 +38,7 @@ export default async function tipDemo({ stage }) {
   await stage.clearCaption();
 
   await stage.caption('Tip, total, and per-person share — computed live.');
-  await stage.point((page) => page.locator('.row').filter({ hasText: 'Per person' }).locator('span').last());
+  await stage.point('#per-person');
   await stage.pause(3600);
   await stage.clearCaption();
   await stage.pause(400);
