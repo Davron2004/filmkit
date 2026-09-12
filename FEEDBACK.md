@@ -779,6 +779,67 @@ for the same underlying reason.
 
 ---
 
+## 19. A mid-take seg-drop swallows wall, and the stitch hides it (robustness gap, 2026-09-04)
+
+**Wanted:** a 6-minute generation take (`tea-1-compose-to-transmute/take-7`): grid → composer →
+ask → clarify → plan → Build → ghost wait → transmute → hold.
+
+**Happened:** `status: "truncated"` — seg002 recorded 1 frame in 170s (no moov, dropped),
+~170s of wall gone from the MIDDLE of the take. The stitch still reports ok and the output is a
+clean 188s file, because the missing stretch was a static ghost tile: video 0–170s = wall 0–170s,
+video 170–188s = wall ~340–358s, and the jump is invisible. Flow green, guard clean, 6 taps, and
+nothing except the sidecar's `truncationReason` says the middle is gone. Had the transmute fallen
+in the gap instead of at video ~180.5s, the take would be a dead one wearing a clean file.
+
+**Did instead:** re-verified the moment by scene-detect
+(`fps=2,select='gt(scene,0.08)',showinfo`, transmute at 180.5s) rather than trusting flow green,
+and cut the cold open from 178–184s. Take kept.
+
+**Fix:** when a middle segment drops, say so on the console in words ("seg002 dropped — video
+jumps from wall ~170s to wall ~340s"), not just `"truncated": true` in the sidecar. Even better:
+record the wall→video offset map per surviving segment (tapSync already computes it) into
+`recording`, so an editor can place the transmute without re-deriving the jump. At minimum the
+docs should state that a truncated take's video timeline is discontinuous.
+
+---
+
+## 20. Output `-to` never fires under a sped filter (edit-room footgun, 2026-09-04)
+
+**Wanted:** cut the LinkedIn rough assembly per segment with 8x on the two typed beats:
+`ffmpeg -i src -ss A -to B -vf "setpts=(PTS-STARTPTS)/8,..."`.
+
+**Happened:** both 8x segments came out ~unsped (29.9s → 8.5s, 23.2s → 22.3s) while every 1x
+segment was exact, so the assembly ran 126.8s against a 102.6s recipe. `-to` as an OUTPUT option
+compares post-filter timestamps; after `setpts/8` the output clock runs 8x slow against the
+input, so the stop point is never reached and the segment runs long.
+
+**Did instead:** output `-ss A -t (B-A)/sp` per segment, which stops on the sped output clock.
+Assembly then matched the recipe to 0.03s.
+
+**Fix:** doc note. Anywhere the VFR `fps`-then-`trim` idiom (#18) is given, add: when a speed
+change is in the filter, bound the segment with `-t` (output duration), not `-to` (absolute stop),
+because `-to` is evaluated after the filter. One sentence saves a 24-second mystery.
+
+---
+
+## 21. Maestro `text:` whole-string regex, again (doc gap follow-up to #14, 2026-09-04)
+
+**Wanted:** gate the fork beats on the slider label both app versions render.
+
+**Happened:** `visible: "Steep time"` timed out three full takes (`take-3/4/5`) while v1 sat on
+screen rendering "Steep time (seconds)". Bare `"Steep time"` never matches a longer node —
+`text:` is a whole-string regex. Cost three ~70s takes before the pattern was spotted; the fix
+was `".*Steep time.*"` (and `".*Strength.*"` for the v2-only gate).
+
+**Did instead:** fixed the flow (`5-fork.yaml` header now says so) and `take-6` went green first
+try, 12 taps, guard clean.
+
+**Fix:** #14 documents Maestro facts that cost takes; add this one line there (or in the
+README's flow-authoring section): "`text:` must match the WHOLE accessibility string — wrap
+substrings in `.*….*`". It is the same class of silent mismatch as #14's `inputText` appends.
+
+---
+
 # Web camera friction log — IEC Karla enrolment demo (2026-09-03)
 
 Written by an agent filming a 12-step operator walkthrough of a Firebase-hosted React SPA
@@ -884,3 +945,115 @@ ones an agent hits on every flow.
 7. "Playwright REPL" exploration advice: the two-pass workflow now says to read the project's
    own e2e specs for selectors first, then confirm the unknowns with `snapshotText()` inside
    ego-browser, and points at this file as where to log friction after a run.
+
+## 2026-09-11 — framing-studio demo (web, ego, 1440x900)
+
+- Clean run, first take usable. 92.4s raw, 89.6s tight.
+- `waitFor` caps at 10s, but a Stripe Checkout redirect took 5-8s after the click and the
+  overlay had to re-dress on the new origin. Needed a manual `pause(5000)` before `waitFor`
+  to be safe. A `waitFor(target, { timeoutMs })` option would remove the guesswork.
+- `stage.type` into Stripe's hosted card fields (real inputs, not iframes) worked as-is.
+- Exploration in a separate ego task space left a pending order in the demo's DB that then
+  showed up in the filmed orders list. Not a filmkit problem, but a reminder: dry-run side
+  effects land in the take when the app has shared state.
+
+---
+
+# Third filming session, 2026-09-11
+
+Whim app again, on a new device profile: Pixel 9 Pro XL AVD at stock 1344x2992, Android 16,
+Maestro 2.6.0, ffmpeg 9.0.1. Most of what follows is new because the device is new.
+
+## 22. No `--size` matched to the device: the encoder fallback changes aspect, not just resolution (bug, follow-up to #1)
+
+**Wanted:** film at this AVD's native resolution, 1344x2992.
+
+**Happened:** with no `--size` given, `screenrecord` printed `ERROR: unable to configure
+video/avc codec at 1344x2992 (err=-22)` then `WARNING: failed at 1344x2992, retrying at
+720x1280`, and filmkit kept recording. The actual content area came out 574x1280, pillarboxed
+inside the 720x1280 container: wrong aspect ratio, unusable. 1080x2404, same aspect as native,
+turned out to be encoder-acceptable on this device.
+
+**Fix:** preflight-probe the encoder with a throwaway 2s `screenrecord --size` and pick the
+largest accepted size that keeps the native aspect, or at minimum abort when the fallback
+changes the aspect ratio rather than just the pixel count. Worth documenting outright: "native
+size" is not filmable on tall AVDs like this one.
+
+## 23. A fully static segment looks identical to a dead one (robustness gap)
+
+**Wanted:** film a generation-wait shot where the screen legitimately does not move for a long
+stretch.
+
+**Happened:** the screen sat motionless for a whole 170s segment (SystemUI demo mode freezes
+even the clock), so `screenrecord` logged `Encoder stopping; recorded 1 frames in 170 seconds`,
+wrote no moov atom, and exited 0 with `Time limit reached`. filmkit dropped the segment, marked
+the take truncated / `ok: false`, and renamed it `take-1.failed.mp4`. For a generation-wait shot
+this is the normal case, not a failure, and each occurrence risks a retake that burns a paid LLM
+generation on the strength of that message alone. Two neighbouring segments hit the same thing,
+with 138 and 4 packets respectively.
+
+**Fix:** when a segment ran its full time limit, exited 0, and produced exactly one frame,
+stitch it as a held frame (copy of the previous segment's last frame, or the next segment's
+first) and report "static segment held" instead of failing the take.
+
+## 24. `--tighten` built its cut plan against a different segment set than it applied to (bug, related to #3/#19)
+
+**Wanted:** a tightened cut of a take that also had a mid-recording segment drop.
+
+**Happened:** the tighten plan was built from `.take-1.pre-taps.mp4` but applied to the burned
+file. The tightened output (150s) ended on an intermediate ghost-tile frame, while the raw file
+(485s) held the actual transmute at roughly 477s, so the shot's whole payoff got cut. A
+standalone `tighten.mjs` pass straight on the burned file with `--noise auto` found 0%
+bit-identical frames, fell back to -60dB, and removed 86% of the clip (485s to 70s), also
+unusable.
+
+**Fix:** guard the plan against a dropped or renumbered segment; refuse or warn when the detect
+source and the apply target disagree about segment count. Separately, never let a cut land in
+the last few seconds after the final flow command, that stretch is almost always the shot.
+
+## 25. Tightened output re-encodes far below source bitrate (missing feature)
+
+**Happened:** measured across three takes, tightened output ran roughly 95-120 kbps against
+1.6-2.3 Mbps on the raw file. Fine for flat UI, visibly bad on anything photographic.
+
+**Fix:** a `--crf` or bitrate passthrough on tighten, or match the source bitrate by default
+instead of falling back to an encoder default.
+
+## 26. Maestro `swipe` rejects fractional percentages (doc gap)
+
+**Happened:** `start: "23.4%,44%"` fails Maestro's parser outright (`Parsing Failed at
+...:11:1`, no hint what's wrong). Integer percentages or absolute pixels work; `start:
+"310,1306"` is also more precise for a specific point.
+
+**Fix:** a line in the README's mobile flow section, next to the existing Maestro idioms.
+
+## 27. Maestro driver comes up UNAVAILABLE right after a prior invocation (robustness gap)
+
+**Happened:** a `maestro test` launched a few seconds after some `maestro hierarchy` calls
+failed at startup with `io.grpc.StatusRuntimeException: UNAVAILABLE` (`Orchestra.initJsEngine`
+-> `deviceInfo`), before any flow command ran. filmkit recorded a 9.8s failed take and a
+`.failed.json` for a driver hiccup that had nothing to do with the flow. A plain retry worked
+immediately.
+
+**Fix:** a short settle, or one automatic retry, in preflight when the driver comes back
+UNAVAILABLE.
+
+## 28. adb keyevents into a WebView number field (doc note, follow-up to #14 item 4)
+
+**Happened:** driving a WebView numeric input with adb keyevents (`KEYCODE_DEL`, `MOVE_HOME`/
+`END`, `CTRL+A`) produced garbage: `190` -> `10180` -> `1080`. For a slider-backed value,
+tapping the track directly sets it exactly and is the reliable path.
+
+**Fix:** belongs next to the existing "inputText appends" note in the README's Maestro idioms
+section.
+
+## 29. A detached camera process dies with the shell that spawned it (doc note)
+
+**Happened:** a camera process launched as a child of an agent's shell dies the moment that
+shell's turn ends, taking a long take down with it mid-recording. The log froze mid-`inputText`,
+no EXIT line, empty debug dir. Not a filmkit bug; launching detached (`(nohup sh -c '...; echo
+EXIT=$?' > log 2>&1 &)`) and polling the log avoided it.
+
+**Fix:** the README's "run it and wait" framing invites this failure mode; worth a line for
+anyone driving filmkit from an agent shell rather than a human terminal.
+

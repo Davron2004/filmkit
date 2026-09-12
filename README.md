@@ -20,7 +20,7 @@ generalized so no part of it knows about any particular app.
 npm i                       # only needed for the web camera's --browser playwright fallback
 npx playwright install chromium   # once, for that fallback; downloads Chromium (~150 MB)
 
-node film-android.mjs       # android/ios cameras need NO npm install at all
+node film-android.mjs my-flow.yaml --tighten   # android/ios cameras need NO npm install at all
 ```
 
 The web camera's default, `--browser ego`, needs neither of those. It films inside `ego-browser`,
@@ -121,7 +121,7 @@ stage.click('label:has-text("Tip %") input');
 ```
 
 Flags: `[--browser ego|playwright] [--out <dir>] [--name <stem>] [--force] [--viewport <WxH>]
-[--serve-root <dir>] [--tighten]`. Overwrite refusal mirrors the Android camera: an existing
+[--serve-root <dir>] [--tighten] [--min-still <sec>] [--keep <sec>] [--noise <level>]`. Overwrite refusal mirrors the Android camera: an existing
 `<name>.mp4` / `.json` / `-tight.mp4` is never overwritten, and the run refuses in preflight,
 before a browser is even launched, unless you pass `--force`.
 
@@ -157,6 +157,8 @@ node film-android.mjs shot-10.yaml --out demo/raw/10-fork --name take-2 --size 9
 # fail the run if anything else comes to the foreground mid-take:
 node film-android.mjs shot-10.yaml --guard-app com.example
 node film-android.mjs shot-10.yaml --guard-app com.example --guard-strict   # and stop the flow there
+node film-android.mjs shot-6.yaml --guard-app com.example \
+  --guard-allow com.google.android.apps.nexuslauncher   # this shot deliberately shows home
 ```
 
 Tap indicators are burned into every take by default; pass `--no-show-taps` to film without them
@@ -170,7 +172,9 @@ that matter:
   stem instead (`<basename>.mp4`, `<basename>-tight.mp4`, `<basename>.json`) and `--out <dir>` sets
   the directory. An existing output is never overwritten. The run refuses in preflight, before the
   device is touched, unless you pass `--force`. Filming is a repeated activity, and a clobbered
-  take is gone.
+  take is gone. A run that fails (flow-failed, interloper, truncated, taps-missing) renames what
+  was filmed to `<basename>.failed.mp4` / `.failed.json`, so `ls *.mp4` shows only real takes and
+  the take number stays free for the next roll.
 - **`screenrecord` runs with `--verbose`.** It costs nothing on the recording and buys the tap
   ripples their anchor: the "Content area is..." line it prints is the reference point every tap
   time and every tap coordinate is placed against (see Tap indicators below). It is probed for
@@ -214,13 +218,29 @@ that matter:
   still exits 0, so filmkit scans the concat's stderr for `Non-monotonic DTS` and compares the
   finished duration against the timeline the directives planned. Either one off prints a loud
   warning and lands in the sidecar's `stitch` block.
+- **The output is VFR — seek and cut accordingly.** Device recordings emit no frames while the
+  screen is still, so `-ss 344 -i take.mp4` lands on the next emitted frame (seconds late) rather
+  than the requested time. Resample before cutting:
+  `ffmpeg -i take.mp4 -vf "fps=30,trim=start=352:end=367,setpts=PTS-STARTPTS" …`. When a speed
+  change is in the filter, bound the segment with output `-t (B-A)/sp`, not `-to`: `-to` is
+  evaluated after the filter, so a `/8` output clock never reaches the stop point and the segment
+  runs long. A truncated take's video timeline is discontinuous (a dropped middle segment jumps
+  wall time with no frames in between — see the seam offsets in the sidecar).
 - **`--size <WxH>`.** Plenty of emulator AVDs ship an AVC encoder that cannot be configured at a
   high-density native resolution. `screenrecord` says so, `unable to configure video/avc codec at
   1344x2992 (err=-22)`, and then records 720x1280 without telling you, which ruins a capture set
   that has to intercut. Pin the geometry with `--size`, keeping the device's aspect ratio and
   raising `--bit-rate` alongside it. Two nets catch the fallback anyway. The recorder's stderr is
   echoed as `[screenrecord] segNNN: ...`, and the finished file's geometry is checked against what
-  was asked for, with a loud warning on mismatch.
+  was asked for, with a loud warning on mismatch. `--strict-size` turns that mismatch into a
+  non-zero exit (the take is kept, renamed to `.failed.*`).
+- **Tighten knobs.** `--tighten` forwards `--min-still`, `--keep` and `--noise` to `tighten.mjs`
+  (defaults 1.2s / 0.6s / `auto`), so `--keep 2.0` needs no second command. Same flags on iOS and web.
+- **Head/tail and target.** Every run prints `recorded <wall>s (flow <maestro>s + 1.5s warmup + 2s
+  finalize + <startup>s startup/transport) → file <dur>s`, so one take tells you your overhead for
+  duration-constrained shots. `--trim-head <sec>` / `--trim-tail <sec>` cut that off the stitched
+  file before taps are placed (VFR-safe re-encode; tap times shift with it). `--target-duration
+  <sec>` only reports how far off you landed.
 - **`--guard-app <pkg>`, the foreground watchdog.** A flow only knows what its selectors can see,
   and "covered by another app" satisfies most of them. `extendedWaitUntil: { notVisible: "Building…" }`
   returns COMPLETED the moment a neighbouring app draws over the screen, so a take can end on
@@ -250,12 +270,20 @@ that matter:
   might route one through an activity. The launcher is not on it, because home showing means your
   app got backgrounded, which is the failure. Neither is the bare `android` package, where the
   share sheet and the ANR dialog live. If your flow opens a share sheet on purpose, don't pass a
-  guard package for it.
+  guard package for it. If your shot deliberately backgrounds the app (a kill-to-home persistence
+  proof), pass `--guard-allow <pkg>` (repeatable) for that run — it adds to the allowlist without
+  changing the default.
   An unreadable sample (screen off, an activity transition caught mid-dump) is recorded as
   `unknown` and never counts as an interloper; a run of five in a row says so, because a watchdog
   that has quietly stopped watching is worse than none.
+- **Seams are surfaced.** The sidecar's `recording` block carries `seamOffsetsSec` (e.g.
+  `[170.0, 340.0]`, `[]` for a single segment) plus a `wallMap` of wall→video offsets per
+  surviving segment, and multi-segment runs print the offsets on the console. A dropped middle
+  segment prints `seg002 dropped — video jumps from wall ~170s to wall ~340s` in words, not just
+  `"truncated": true`. Use `node tools/timeline.mjs <take.mp4>` to check a seam against the
+  moment (below).
 - **Provenance sidecar.** Every run that reaches the camera writes `<name>.json` next to the
-  video: a `status` (`ok`, `truncated`, `interloper`, `taps-missing`, `flow-failed`, `interrupted`,
+  video: `ok` plus a `status` (`ok`, `truncated`, `interloper`, `taps-missing`, `flow-failed`, `interrupted`,
   `failed`), flow path and SHA-256 of its contents, argv, device serial and build fingerprint,
   requested vs. actual size, bit rate, each segment's wall/container/timeline durations, whether it
   was dropped and why, recorder warnings, the stitch's planned-vs-actual check, raw duration, the
@@ -306,8 +334,30 @@ that matter:
 - **`notVisible` is satisfied by being covered.** Every wait that ends on something *disappearing*
   also ends when another app draws over the screen, and the flow reports COMPLETED either way. This
   is not fixable in the flow. Pass `--guard-app <pkg>` so the recorder notices instead.
+- **A flow with no `launchApp` honours long waits.** The `launchApp` truncation above has a useful
+  complement: with `launchApp` removed, a 45 000 ms wait inside a nine-step flow held the full 45s,
+  and a 720 000 ms wait held nearly five minutes. Workaround for a long-hold flow: foreground the
+  app yourself before rolling and drop `launchApp` from the flow.
+- **Pauses inside `runFlow: { when: … }` are not truncated** the way pauses inside `repeat:` are. A
+  20 000 ms optional wait inside a `when` block took the full 20s. `runFlow` with `when` is the way
+  to script through a screen that may or may not appear (e.g. an LLM clarify step the server
+  sometimes skips).
+- **Relative selectors resolve to the first hierarchy match, not the nearest element.**
+  `tapOn: { text: ".*", below: { text: ".*\\?" } }` finds the first tappable thing under the first
+  question — useful when every label is generated text. The mirror image does not work: anchoring
+  `above:` a fixed bottom line lands on the header Back button, the first node in the tree above
+  the anchor.
+- **`hideKeyboard` is safe on native screens, back-navigation in a WebView.** On the host app's own
+  screens it dismisses the IME and stays put. On a WebView screen the same command can leave the
+  app entirely, losing typed state.
+- **A control's accessible name can carry its state.** A `Drink water` checkbox becomes
+  `✓ Drink water` once ticked, and since `text:` is a whole-string regex, the first-half selector
+  silently stops matching. Anything surviving a state change wants `.*Drink water.*`.
+- **`text:` must match the WHOLE string — wrap substrings in `.*….*`.** `visible: "Steep time"`
+  never matches a node rendering "Steep time (seconds)"; use `".*Steep time.*"`. Same class of
+  silent mismatch as `inputText` appending below.
 - **Selectors.** Visible text or accessibility labels (what `maestro hierarchy` reads), never
-  coordinates. Debug with `maestro hierarchy`.
+  coordinates. Debug with `maestro hierarchy` (see `tools/hierarchy.mjs`).
 - **Replace text cleanly.** `inputText` APPENDS at the cursor; `eraseText` is unreliable in
   WebViews (controlled inputs re-render a stray leading char that later keystrokes never
   overwrite). The clean gesture is
@@ -340,6 +390,10 @@ Notes:
 - `--clean-status-bar` overrides the clock to 9:41, full battery and signal, and clears the
   override after the run.
 - No 180s cap here (unlike Android). Recording writes straight to disk on the host.
+- **The output is VFR — seek and cut accordingly.** Like Android, `simctl` emits no frames while
+  the screen is still, so `-ss` before `-i` lands on the next emitted frame rather than the
+  requested time. Resample first: `-vf "fps=30,trim=start=A:end=B,setpts=PTS-STARTPTS"`. With a
+  speed filter in the graph, bound with output `-t (B-A)/sp`, not `-to` (evaluated post-filter).
 - Boot readiness uses `bootstatus -b`, since a bare "(Booted)" status can precede Springboard
   being ready.
 - **Recorder timestamp repair.** `simctl`'s mp4 sometimes carries composition offsets that put
@@ -516,6 +570,18 @@ it at full length. That is the honest reading of the footage, and it is why a 14
 progress take tightens to 76s rather than to nothing. Compressing that stretch anyway is an
 editorial call, not a detection one. `--noise -60dB` gives you the old change-must-be-big
 behaviour, with the sanity-floor warning attached.
+
+## Inspection tools
+
+- **`tools/hierarchy.mjs`** — readable `maestro hierarchy`. Piped (`maestro --device <s> hierarchy |
+  node tools/hierarchy.mjs`) or direct (`--device <serial>` / `--in <file>`), one
+  `text | a11y | class | bounds | click=` line per node with text. `--clickable-only` filters.
+- **`node tools/timeline.mjs <take.mp4>`** — the take's edit list without watching it: one ffmpeg
+  pass at 1fps hashing frames, one line per screen change, seams from the sidecar marked and a
+  warning when a seam sits inside motion (±2s both sides). `--fps <n>` resamples the sampling.
+
+Internal ffmpeg calls run with `-hide_banner -loglevel error`; pass `--verbose` (Android) to see
+the full banner and stream tables. A flow failure's one line is no longer buried under them.
 
 ## Which camera when
 

@@ -161,6 +161,9 @@ function parseArgs(argv) {
   let showTaps = true;
   let force = false;
   let doTighten = false;
+  let minStill = 1.2;
+  let keep = 0.6;
+  let noise = 'auto';
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') {
       out = valueFor(argv, i, '--out', usageError);
@@ -190,6 +193,15 @@ function parseArgs(argv) {
       cleanStatusBar = true;
     } else if (argv[i] === '--tighten') {
       doTighten = true;
+    } else if (argv[i] === '--min-still') {
+      minStill = Number(valueFor(argv, i, '--min-still', usageError));
+      i++;
+    } else if (argv[i] === '--keep') {
+      keep = Number(valueFor(argv, i, '--keep', usageError));
+      i++;
+    } else if (argv[i] === '--noise') {
+      noise = String(valueFor(argv, i, '--noise', usageError));
+      i++;
     } else {
       rest.push(argv[i]);
     }
@@ -198,7 +210,8 @@ function parseArgs(argv) {
     console.error(
       'usage: node film-ios.mjs <flow.yaml> [--out <dir>] [--name <basename>] [--force] ' +
         '[--simulator <name-or-udid>] [--install <path.app|path.ipa>]... [--app <bundle-id>] ' +
-        '[--fresh] [--codec h264|hevc] [--clean-status-bar] [--no-show-taps] [--tighten]',
+        '[--fresh] [--codec h264|hevc] [--clean-status-bar] [--no-show-taps] [--tighten] ' +
+        '[--min-still <sec>] [--keep <sec>] [--noise <level>]',
     );
     process.exit(1);
   }
@@ -222,6 +235,12 @@ function parseArgs(argv) {
     );
     process.exit(1);
   }
+  if (!Number.isFinite(minStill) || minStill <= 0) {
+    usageError(`--min-still must be a positive number of seconds (got "${minStill}")`);
+  }
+  if (!Number.isFinite(keep) || keep < 0) {
+    usageError(`--keep must be a non-negative number of seconds (got "${keep}")`);
+  }
   return {
     flowArg: rest[0],
     outDir: out ? resolve(out) : DEFAULT_OUT_DIR,
@@ -235,6 +254,9 @@ function parseArgs(argv) {
     showTaps,
     force,
     doTighten,
+    minStill,
+    keep,
+    noise,
   };
 }
 
@@ -689,7 +711,7 @@ async function sha256(path) {
 }
 
 async function main() {
-  const { flowArg, outDir, name, simulator, installs, appId, fresh, codec, cleanStatusBar, showTaps, force, doTighten } =
+  const { flowArg, outDir, name, simulator, installs, appId, fresh, codec, cleanStatusBar, showTaps, force, doTighten, minStill, keep, noise } =
     parseArgs(process.argv.slice(2));
   const flowPath = resolve(flowArg);
   const flowName = name ?? `${basename(flowPath, extname(flowPath))}-ios`;
@@ -1090,6 +1112,9 @@ async function main() {
   if (doTighten) {
     try {
       const result = await tighten(outPath, {
+        minStill,
+        keep,
+        noise,
         // Rings were burned in, so freeze detection against outPath would be reading the burn's
         // own quantization noise, not the recorder's — see DETECT-FROM in tighten.mjs's header.
         // Without rings (no taps, or --no-show-taps) this stays undefined and tighten runs exactly

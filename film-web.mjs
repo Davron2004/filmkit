@@ -55,7 +55,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const USAGE =
   'usage: node film-web.mjs <flow-file.mjs> [--browser ego|playwright] [--out <dir>]\n' +
   '                        [--name <stem>] [--force] [--viewport <WxH>] [--serve-root <dir>]\n' +
-  '                        [--tighten]';
+  '                        [--tighten] [--min-still <sec>] [--keep <sec>] [--noise <level>]';
 
 function parseArgs(argv) {
   const rest = [];
@@ -66,6 +66,9 @@ function parseArgs(argv) {
   let viewport = VIEWPORT;
   let serveRoot;
   let doTighten = false;
+  let minStill = 1.2;
+  let keep = 0.6;
+  let noise = 'auto';
   // `--out --force` must not create a directory called "--force"; see lib/args.mjs.
   const usageError = (msg) => {
     console.error(msg);
@@ -94,6 +97,15 @@ function parseArgs(argv) {
       i++;
     } else if (argv[i] === '--tighten') {
       doTighten = true;
+    } else if (argv[i] === '--min-still') {
+      minStill = Number(take(i, '--min-still'));
+      i++;
+    } else if (argv[i] === '--keep') {
+      keep = Number(take(i, '--keep'));
+      i++;
+    } else if (argv[i] === '--noise') {
+      noise = take(i, '--noise');
+      i++;
     } else {
       rest.push(argv[i]);
     }
@@ -112,6 +124,8 @@ function parseArgs(argv) {
     console.error(err.message);
     process.exit(1);
   }
+  if (!Number.isFinite(minStill) || minStill <= 0) usageError(`--min-still must be positive (got "${minStill}")`);
+  if (!Number.isFinite(keep) || keep < 0) usageError(`--keep must be non-negative (got "${keep}")`);
   return {
     flowArg: rest[0],
     outDir: out ? resolve(out) : DEFAULT_OUT_DIR,
@@ -121,6 +135,9 @@ function parseArgs(argv) {
     viewport,
     serveRoot: serveRoot ? resolve(serveRoot) : undefined,
     doTighten,
+    minStill,
+    keep,
+    noise,
   };
 }
 
@@ -361,7 +378,7 @@ async function filmWithPlaywright({ flowPath, viewport, outDir, ffmpeg, mp4Path 
 }
 
 async function main() {
-  const { flowArg, outDir, name, browser, force, viewport, serveRoot, doTighten } = parseArgs(process.argv.slice(2));
+  const { flowArg, outDir, name, browser, force, viewport, serveRoot, doTighten, minStill, keep, noise } = parseArgs(process.argv.slice(2));
   const flowPath = resolve(flowArg);
   // "tip-demo.demo.mjs" → "tip-demo" (the video's base filename), unless --name overrides it.
   const flowName = name ?? basename(flowPath, extname(flowPath)).replace(/\.demo$/, '');
@@ -436,6 +453,9 @@ async function main() {
         .filter((e) => e.kind === 'caption' || e.kind === 'pause')
         .map(({ start, end }) => ({ start, end }));
       const result = await tighten(filmed.path, {
+        minStill,
+        keep,
+        noise,
         protect,
         protectMarginSec: filmed.clock === 'frame' ? 0 : 0.5,
         sidecar: false,

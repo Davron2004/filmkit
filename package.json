@@ -10,7 +10,10 @@
   "scripts": {
     "film:web": "node film-web.mjs",
     "film:android": "node film-android.mjs",
-    "tighten": "node tighten.mjs"
+    "film:ios": "node film-ios.mjs",
+    "tighten": "node tighten.mjs",
+    "hierarchy": "node tools/hierarchy.mjs",
+    "timeline": "node tools/timeline.mjs"
   },
   "devDependencies": {
     "playwright": "1.60.0"

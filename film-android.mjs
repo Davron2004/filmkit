@@ -9,8 +9,11 @@
 //
 //   node film-android.mjs <flow.yaml> [--out <dir>] [--name <basename>] [--force]
 //        [--device <serial>] [--avd <name>] [--install <apk>]... [--app <package-id>] [--fresh]
-//        [--guard-app <package-id>] [--guard-strict]
-//        [--bit-rate <n>] [--size <WxH>] [--segment-seconds <n>] [--tighten] [--no-show-taps]
+//        [--guard-app <package-id>] [--guard-allow <package-id>]... [--guard-strict]
+//        [--bit-rate <n>] [--size <WxH>] [--strict-size] [--segment-seconds <n>] [--tighten]
+//        [--min-still <sec>] [--keep <sec>] [--noise <auto|-60dB>]
+//        [--trim-head <sec>] [--trim-tail <sec>] [--target-duration <sec>]
+//        [--no-show-taps] [--verbose]
 //
 // NAMING: output defaults to `<out>/<flow>-android.mp4`. `--name <basename>` overrides the stem
 // (`<out>/<basename>.mp4`, `<out>/<basename>-tight.mp4`, `<out>/<basename>.json`) so a storyboard
@@ -302,8 +305,10 @@ const FOREGROUND_ALLOW = [
 const USAGE =
   'usage: node film-android.mjs <flow.yaml> [--out <dir>] [--name <basename>] [--force] ' +
   '[--device <serial>] [--avd <name>] [--install <apk>]... [--app <package-id>] [--fresh] ' +
-  '[--guard-app <package-id>] [--guard-strict] ' +
-  '[--bit-rate <n>] [--size <WxH>] [--segment-seconds <n>] [--tighten] [--no-show-taps]';
+  '[--guard-app <package-id>] [--guard-allow <package-id>]... [--guard-strict] ' +
+  '[--bit-rate <n>] [--size <WxH>] [--strict-size] [--segment-seconds <n>] [--tighten] ' +
+  '[--min-still <sec>] [--keep <sec>] [--noise <level>] ' +
+  '[--trim-head <sec>] [--trim-tail <sec>] [--target-duration <sec>] [--no-show-taps] [--verbose]';
 
 function log(msg) {
   console.log(`[film-android] ${msg}`);
@@ -326,12 +331,21 @@ function parseArgs(argv) {
   let appId;
   let fresh = false;
   let guardApp;
+  let guardAllow = [];
   let guardStrict = false;
   let bitRate = DEFAULT_BIT_RATE;
   let size;
+  let strictSize = false;
   let segmentSeconds = DEFAULT_SEGMENT_SECONDS;
   let doTighten = false;
+  let minStill = 1.2;
+  let keep = 0.6;
+  let noise = 'auto';
+  let trimHead = 0;
+  let trimTail = 0;
+  let targetDuration = null;
   let showTaps = true;
+  let verbose = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') {
       out = valueFor(argv, i, '--out', usageError);
@@ -358,8 +372,13 @@ function parseArgs(argv) {
     } else if (argv[i] === '--guard-app') {
       guardApp = valueFor(argv, i, '--guard-app', usageError);
       i++;
+    } else if (argv[i] === '--guard-allow') {
+      guardAllow.push(valueFor(argv, i, '--guard-allow', usageError));
+      i++;
     } else if (argv[i] === '--guard-strict') {
       guardStrict = true;
+    } else if (argv[i] === '--strict-size') {
+      strictSize = true;
     } else if (argv[i] === '--bit-rate') {
       bitRate = String(valueFor(argv, i, '--bit-rate', usageError));
       i++;
@@ -371,6 +390,26 @@ function parseArgs(argv) {
       i++;
     } else if (argv[i] === '--tighten') {
       doTighten = true;
+    } else if (argv[i] === '--min-still') {
+      minStill = Number(valueFor(argv, i, '--min-still', usageError));
+      i++;
+    } else if (argv[i] === '--keep') {
+      keep = Number(valueFor(argv, i, '--keep', usageError));
+      i++;
+    } else if (argv[i] === '--noise') {
+      noise = String(valueFor(argv, i, '--noise', usageError));
+      i++;
+    } else if (argv[i] === '--trim-head') {
+      trimHead = Number(valueFor(argv, i, '--trim-head', usageError));
+      i++;
+    } else if (argv[i] === '--trim-tail') {
+      trimTail = Number(valueFor(argv, i, '--trim-tail', usageError));
+      i++;
+    } else if (argv[i] === '--target-duration') {
+      targetDuration = Number(valueFor(argv, i, '--target-duration', usageError));
+      i++;
+    } else if (argv[i] === '--verbose') {
+      verbose = true;
     } else if (argv[i] === '--no-show-taps') {
       showTaps = false;
     } else {
@@ -415,6 +454,30 @@ function parseArgs(argv) {
     );
     process.exit(1);
   }
+  if (!Number.isFinite(minStill) || minStill <= 0) {
+    console.error(`--min-still must be a positive number of seconds (got "${minStill}")`);
+    process.exit(1);
+  }
+  if (!Number.isFinite(keep) || keep < 0) {
+    console.error(`--keep must be a non-negative number of seconds (got "${keep}")`);
+    process.exit(1);
+  }
+  if (typeof noise !== 'string' || noise.trim() === '') {
+    console.error(`--noise needs a value — "auto" or a freezedetect level like -60dB`);
+    process.exit(1);
+  }
+  if (!Number.isFinite(trimHead) || trimHead < 0) {
+    console.error(`--trim-head must be a non-negative number of seconds (got "${trimHead}")`);
+    process.exit(1);
+  }
+  if (!Number.isFinite(trimTail) || trimTail < 0) {
+    console.error(`--trim-tail must be a non-negative number of seconds (got "${trimTail}")`);
+    process.exit(1);
+  }
+  if (targetDuration !== null && (!Number.isFinite(targetDuration) || targetDuration <= 0)) {
+    console.error(`--target-duration must be a positive number of seconds (got "${targetDuration}")`);
+    process.exit(1);
+  }
   return {
     flowArg: rest[0],
     outDir: out ? resolve(out) : DEFAULT_OUT_DIR,
@@ -426,12 +489,21 @@ function parseArgs(argv) {
     appId,
     fresh,
     guardedApp,
+    guardAllow,
     guardStrict,
     bitRate,
     size,
+    strictSize,
     segmentSeconds,
     doTighten,
+    minStill,
+    keep,
+    noise,
+    trimHead,
+    trimTail,
+    targetDuration,
     showTaps,
+    verbose,
   };
 }
 
@@ -699,8 +771,17 @@ export function parseTopResumed(dumpsysText) {
   return { package: match[1], activity: match[2] };
 }
 
-export function isAllowedOverlay(pkg) {
-  return FOREGROUND_ALLOW.some((pattern) => pattern.test(pkg));
+export function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function extraAllowPatterns(extraAllow) {
+  return (extraAllow ?? []).map((pkg) => new RegExp(`^${escapeRegExp(pkg)}($|\\.)`));
+}
+
+export function isAllowedOverlay(pkg, extraAllow = []) {
+  if (FOREGROUND_ALLOW.some((pattern) => pattern.test(pkg))) return true;
+  return extraAllowPatterns(extraAllow).some((pattern) => pattern.test(pkg));
 }
 
 // One sample. Grepping ON the device matters: the full `dumpsys activity activities` is hundreds
@@ -720,15 +801,15 @@ async function readForeground(adb, deviceId) {
   }
 }
 
-function classify(sighting, guardedApp) {
+function classify(sighting, guardedApp, extraAllow = []) {
   if (sighting.verdict === 'unknown') return 'unknown';
   if (sighting.package === guardedApp) return 'guarded';
-  return isAllowedOverlay(sighting.package) ? 'allowed' : 'interloper';
+  return isAllowedOverlay(sighting.package, extraAllow) ? 'allowed' : 'interloper';
 }
 
 // Polls until stop(). `events` only grows when the answer CHANGES, so a five-minute take that was
 // never disturbed contributes exactly one row (the guarded app, at t≈0) instead of two hundred.
-function startForegroundWatch(adb, deviceId, { guardedApp, startedAt, onInterloper }) {
+function startForegroundWatch(adb, deviceId, { guardedApp, extraAllow = [], startedAt, onInterloper }) {
   const events = [];
   const interlopers = [];
   let stopped = false;
@@ -741,7 +822,7 @@ function startForegroundWatch(adb, deviceId, { guardedApp, startedAt, onInterlop
 
   const sampleOnce = async () => {
     const sighting = await readForeground(adb, deviceId);
-    const verdict = classify(sighting, guardedApp);
+    const verdict = classify(sighting, guardedApp, extraAllow);
     const key = verdict === 'unknown' ? `unknown:${sighting.note}` : `${sighting.package}/${sighting.activity}`;
 
     if (verdict === 'unknown') {
@@ -1090,13 +1171,39 @@ export function contentEndSec(packets, containerSec, tag) {
   return lastPtsSec + Math.min(lastDurSec, NOMINAL_FRAME_SEC);
 }
 
-async function finalizeVideo(ffmpeg, rawPath, outPath) {
+async function finalizeVideo(ffmpeg, rawPath, outPath, { verbose = false } = {}) {
+  const quiet = verbose ? [] : ['-hide_banner', '-loglevel', 'error'];
   try {
-    await run(ffmpeg, ['-y', '-i', rawPath, '-c', 'copy', '-movflags', '+faststart', outPath], { stdio: 'inherit' });
+    await run(ffmpeg, ['-y', ...quiet, '-i', rawPath, '-c', 'copy', '-movflags', '+faststart', outPath], { stdio: 'inherit' });
   } catch (err) {
     log(`ffmpeg remux (stream copy) failed (${err.message}) — falling back to re-encode...`);
-    await run(ffmpeg, ['-y', '-i', rawPath, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', outPath], { stdio: 'inherit' });
+    await run(ffmpeg, ['-y', ...quiet, '-i', rawPath, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', outPath], { stdio: 'inherit' });
   }
+}
+
+async function trimRecording(ffmpeg, inPath, { trimHead = 0, trimTail = 0, verbose = false } = {}) {
+  if (!(trimHead > 0) && !(trimTail > 0)) return { applied: false, reason: 'no trim requested' };
+  const probed = await probeVideo(ffmpeg, inPath);
+  const durationSec = probed.durationSec;
+  if (!(durationSec > 0)) return { applied: false, reason: 'could not probe duration for trim' };
+  const start = Math.max(0, trimHead);
+  const length = durationSec - start - Math.max(0, trimTail);
+  if (!(length > 0)) {
+    throw new Error(`--trim-head ${trimHead}s + --trim-tail ${trimTail}s leaves nothing of a ${durationSec.toFixed(2)}s take`);
+  }
+  const quiet = verbose ? [] : ['-hide_banner', '-loglevel', 'error'];
+  const tmp = `${inPath}.trim.mp4`;
+  // Re-encode (not stream copy): VFR input + `-ss` before `-i` lands on the next emitted frame
+  // rather than the requested time (see README VFR note), so cut on the decoded timeline.
+  await run(
+    ffmpeg,
+    ['-y', ...quiet, '-i', inPath, '-ss', start.toFixed(3), '-t', length.toFixed(3),
+     '-vf', 'fps=30', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+     '-movflags', '+faststart', tmp],
+    { stdio: 'inherit' },
+  );
+  await rename(tmp, inPath);
+  return { applied: true, startSec: Number(start.toFixed(3)), lengthSec: Number(length.toFixed(3)), durationSec };
 }
 
 // Stitch a segment chain into one continuous mp4 (concat demuxer + stream copy + faststart).
@@ -1364,13 +1471,27 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const {
     flowArg, outDir, name, force, device: requestedDevice, avd, installs, appId, fresh,
-    guardedApp, guardStrict, bitRate, size, segmentSeconds, doTighten, showTaps: showTapsRequested,
+    guardedApp, guardAllow, guardStrict, bitRate, size, strictSize, segmentSeconds, doTighten,
+    minStill, keep, noise, trimHead, trimTail, targetDuration, showTaps: showTapsRequested, verbose,
   } = args;
   const flowPath = resolve(flowArg);
   const outName = name ?? `${basename(flowPath, extname(flowPath))}-android`;
-  const outPath = join(outDir, `${outName}.mp4`);
-  const tightPath = join(outDir, `${outName}-tight.mp4`);
-  const sidecarPath = join(outDir, `${outName}.json`);
+  let outPath = join(outDir, `${outName}.mp4`);
+  let tightPath = join(outDir, `${outName}-tight.mp4`);
+  let sidecarPath = join(outDir, `${outName}.json`);
+  const failedMp4Path = join(outDir, `${outName}.failed.mp4`);
+  const failedJsonPath = join(outDir, `${outName}.failed.json`);
+  const failedTightPath = join(outDir, `${outName}.failed-tight.mp4`);
+
+  // A failed run must not burn a take number (#13): rename what was filmed to .failed.* so
+  // `ls *.mp4` shows only real takes. Call BEFORE writing the sidecar so output.path agrees.
+  const markFailed = async () => {
+    try { await rename(outPath, failedMp4Path); } catch {}
+    try { await rename(tightPath, failedTightPath); } catch {}
+    outPath = failedMp4Path;
+    sidecarPath = failedJsonPath;
+    tightPath = failedTightPath;
+  };
 
   let tools;
   try {
@@ -1464,6 +1585,7 @@ async function main() {
   const guard = guardedApp
     ? startForegroundWatch(adb, deviceId, {
         guardedApp,
+        extraAllow: guardAllow,
         startedAt: recordingStartedAt,
         onInterloper: (event) => {
           if (!guardStrict || abortedByGuard) return;
@@ -1523,9 +1645,26 @@ async function main() {
     );
   };
 
-  const writeSidecar = async ({ status, error = null, finalProbe = null, stitch = null, tightResult = null }) => {
+  const writeSidecar = async ({ status, error = null, finalProbe = null, stitch = null, tightResult = null, trim = null, durations = null }) => {
+    // Seam offsets are prefix sums of the surviving segments' timeline slots — the numbers the
+    // stitch directives already laid down. Single-segment → []. Null spans (final slot) play out
+    // to the file end and contribute no seam.
+    const seamOffsetsSec = timeline
+      .slice(1)
+      .map((_, i) => timeline.slice(0, i + 1).reduce((sum, slot) => sum + (slot.spanSec ?? 0), 0))
+      .map((n) => Number(n.toFixed(3)));
+    // Wall→video map: where each surviving segment starts on the wall clock (sec from recorder
+    // start) and where it sits in the video. A dropped middle segment shows up here as a jump.
+    const wallMap = timeline.map((slot) => {
+      const seg = segments.find((s) => segTag(s.index) === slot.tag);
+      const wallStart = seg ? Number(((seg.startedAt - recordingStartedAt) / 1000).toFixed(3)) : null;
+      const wallSec = seg?.wallSec ?? null;
+      const row = { segment: slot.tag, wallStartSec: wallStart, wallSec, offsetSec: Number(slot.offsetSec.toFixed(3)), spanSec: slot.spanSec === null ? null : Number(slot.spanSec.toFixed(3)) };
+      return row;
+    });
     const payload = {
       tool: 'film-android.mjs',
+      ok: status === 'ok',
       status, // ok | truncated | interloper | taps-missing | flow-failed | interrupted | failed
       error,
       filmedAt: new Date().toISOString(),
@@ -1548,14 +1687,23 @@ async function main() {
       },
       recording: {
         requestedSize: size ?? null,
+        strictSize: strictSize ?? false,
         actualSize: finalProbe?.size ?? null,
         bitRate,
         segmentSeconds,
         segmentCount: segments.length,
-        seamCount: Math.max(0, segments.length - 1),
+        seamCount: Math.max(0, timeline.length - 1),
+        seamOffsetsSec,
+        wallMap,
+        trim: trim ?? (trimHead > 0 || trimTail > 0 ? { headSec: trimHead, tailSec: trimTail } : null),
+        durations: durations ?? null,
+        targetDurationSec: targetDuration ?? null,
         wallSec: Number(wallTotalSec().toFixed(3)),
         truncated: Boolean(truncationReason()) || status === 'interrupted',
         truncationReason: truncationReason(),
+        // A truncated take's video timeline is discontinuous: a dropped middle segment jumps wall
+        // time with no frames in between. wallMap + seamOffsetsSec above place the jump.
+        discontinuous: (lossReason && timeline.length > 0) ? true : undefined,
         stitch,
         segments: segments.map((seg) => ({
           index: seg.index,
@@ -1582,9 +1730,10 @@ async function main() {
       guard: guard
         ? {
             app: guardedApp,
+            extraAllow: guardAllow ?? [],
             strict: guardStrict,
             pollSec: FOREGROUND_POLL_MS / 1000,
-            allowlist: FOREGROUND_ALLOW.map(String),
+            allowlist: [...FOREGROUND_ALLOW.map(String), ...(guardAllow ?? []).map((p) => `extra:${p}`)],
             preflight: guardPreflight,
             changeCount: guard.events.length,
             interlopers: guard.interlopers,
@@ -1736,7 +1885,16 @@ async function main() {
               `${(drop.seg.wallSec ?? 0).toFixed(2)}s, so nothing that was on screen is missing from the take.`,
           );
         } else {
-          console.error(`[film-android] ⚠️  ${drop.seg.tag} is unusable: ${drop.reason}`);
+          // Say where the hole is on the WALL clock, not just that a segment died: the stitched
+          // video jumps across it invisibly when the footage either side is static (#19).
+          const order = pulled.findIndex((p) => p.seg === drop.seg);
+          const wallBefore = pulled.slice(0, order).reduce((s, p) => s + (p.seg.wallSec ?? 0), 0);
+          const wallAfter = wallBefore + (drop.seg.wallSec ?? 0);
+          console.error(
+            `[film-android] ⚠️  ${drop.seg.tag} dropped — video jumps from wall ~${wallBefore.toFixed(1)}s ` +
+              `to wall ~${wallAfter.toFixed(1)}s. The middle of the take is missing, even though the ` +
+              `stitched file plays clean. Reason: ${drop.reason}`,
+          );
         }
       }
       if (usable.length === 0) {
@@ -1749,7 +1907,7 @@ async function main() {
         // Single-segment path — identical to what this tool did before chaining existed: pull one
         // file, remux with stream copy + faststart. No concat list, no timestamp rewriting.
         log(`finalizing ${outPath}...`);
-        await finalizeVideo(ffmpeg, usable[0].localPath, outPath);
+        await finalizeVideo(ffmpeg, usable[0].localPath, outPath, { verbose });
       } else {
         const listPath = join(outDir, `.${outName}.concat.txt`);
         const entries = usable.map(({ seg, localPath }, i) => {
@@ -1807,7 +1965,30 @@ async function main() {
         };
       });
 
-      const finalProbe = await probeVideo(ffmpeg, outPath);
+      let finalProbe = await probeVideo(ffmpeg, outPath);
+
+      // TRIM HEAD/TAIL (#4): cut wall-clock head/tail you didn't author off the stitched file,
+      // before taps are placed. Re-encoded (VFR-safe); timeline slots shift by -trimHead.
+      let trim = null;
+      if (trimHead > 0 || trimTail > 0) {
+        try {
+          trim = await trimRecording(ffmpeg, outPath, { trimHead, trimTail, verbose });
+          if (trim.applied) {
+            log(`trimmed ${trimHead.toFixed(2)}s head + ${trimTail.toFixed(2)}s tail → ${trim.lengthSec.toFixed(2)}s`);
+            for (const slot of timeline) slot.offsetSec = Math.max(0, slot.offsetSec - trim.startSec);
+            finalProbe = await probeVideo(ffmpeg, outPath);
+          }
+        } catch (err) {
+          console.error(`[film-android] trim failed (${err.message}) — keeping the untrimmed take`);
+          trim = { applied: false, reason: err.message };
+        }
+      }
+
+      // Seam offsets for the console: the moment you still remember what happened when (#17).
+      if (timeline.length > 1) {
+        const offsets = timeline.slice(1).map((_, i) => timeline.slice(0, i + 1).reduce((s, sl) => s + (sl.spanSec ?? 0), 0));
+        log(`seams at ${offsets.map((o) => `${o.toFixed(1)}s`).join(', ')} (${timeline.length - 1} seam(s))`);
+      }
 
       // The stitch is only believable if the file agrees with the timeline the directives asked
       // for. ffmpeg reports a scrambled concat as a warning and exits 0, so nothing else here
@@ -1822,18 +2003,24 @@ async function main() {
 
       // RESOLUTION check (see the SIZE header).
       const requestedSize = size ?? nativeSize;
+      let sizeMismatch = null;
       if (requestedSize && finalProbe.size && finalProbe.size !== requestedSize) {
         const [rw, rh] = requestedSize.split('x');
         const swapped = `${rh}x${rw}`; // a rotated recording is not a mismatch
         if (finalProbe.size !== swapped) {
+          sizeMismatch =
+            `recorded at ${finalProbe.size}, but ` +
+            `${size ? `--size ${size} was requested` : `the device reports ${nativeSize}`}`;
           console.error(
-            `\n[film-android] ⚠️  RESOLUTION MISMATCH: recorded at ${finalProbe.size}, but ` +
-              `${size ? `--size ${size} was requested` : `the device reports ${nativeSize}`}.\n` +
+            `\n[film-android] ⚠️  RESOLUTION MISMATCH: ${sizeMismatch}.\n` +
               "[film-android]    screenrecord's encoder almost certainly refused that geometry and " +
               'silently fell back (look for an "unable to configure video/avc codec" line above).\n' +
               `[film-android]    Re-film with an explicit --size the encoder accepts if this take has ` +
               'to intercut with others.\n',
           );
+          if (strictSize) {
+            console.error('[film-android]    --strict-size: treating the mismatch as a failure.');
+          }
         }
       }
 
@@ -1854,7 +2041,7 @@ async function main() {
         reportKeptFiles();
       }
 
-      return { ok: true, finalProbe, stitch };
+      return { ok: true, finalProbe, stitch, trim, sizeMismatch };
     } catch (err) {
       console.error(`[film-android] failed to save the recording: ${err.message}`);
       reportKeptFiles();
@@ -1910,6 +2097,8 @@ async function main() {
 
   await sleep(RECORD_WARMUP_MS);
 
+  let maestroWallSec = null;
+  let maestroStartedAt = Date.now();
   try {
     log(`running maestro test ${flowPath}...`);
     // Run from the CALLER's working directory so relative paths inside the flow yaml (screenshots,
@@ -1920,6 +2109,7 @@ async function main() {
     // --debug-output is where the tap times come from. Always on when indicators are wanted,
     // even if this flow file shows no tap commands: an included flow can still tap.
     const argsList = ['--device', deviceId, 'test', ...(showTapsRequested ? ['--debug-output', debugDir] : []), flowPath];
+    maestroStartedAt = Date.now();
     await new Promise((resolveFlow, rejectFlow) => {
       maestroChild = spawn(maestro, argsList, { stdio: 'inherit' });
       maestroChild.on('error', (err) =>
@@ -1935,11 +2125,31 @@ async function main() {
     maestroError = err;
   } finally {
     maestroChild = null;
+    maestroWallSec = Number(((Date.now() - maestroStartedAt) / 1000).toFixed(2));
   }
 
   const outcome = await runHarvest();
   if (interrupted) return; // the SIGINT handler owns the sidecar and the exit code
   reportForeground();
+  // Duration honesty (#4): one run tells you your overhead. Maestro wall includes JVM startup;
+  // the remainder after warmup/finalize is adb/transport slop.
+  {
+    const wall = Number(wallTotalSec().toFixed(2));
+    const flow = maestroWallSec ?? 0;
+    const overhead = Math.max(0, wall - flow - RECORD_WARMUP_MS / 1000 - RECORD_FINALIZE_MS / 1000);
+    const file = outcome.finalProbe?.durationSec ?? null;
+    log(
+      `durations: recorded ${wall.toFixed(2)}s (flow ${flow.toFixed(2)}s + ` +
+        `${(RECORD_WARMUP_MS / 1000).toFixed(1)}s warmup + ${(RECORD_FINALIZE_MS / 1000).toFixed(1)}s finalize + ` +
+        `${overhead.toFixed(2)}s startup/transport)` +
+        (file === null ? '' : ` → file ${file.toFixed(2)}s`),
+    );
+    outcome.durations = { recordingWallSec: wall, flowSec: flow, warmupSec: RECORD_WARMUP_MS / 1000, finalizeSec: RECORD_FINALIZE_MS / 1000, startupOtherSec: Number(overhead.toFixed(2)), fileSec: file };
+  }
+  if (targetDuration !== null && outcome.finalProbe?.durationSec !== null) {
+    const off = outcome.finalProbe.durationSec - targetDuration;
+    log(`target ${targetDuration.toFixed(2)}s → landed ${outcome.finalProbe.durationSec.toFixed(2)}s (${off >= 0 ? '+' : ''}${off.toFixed(2)}s)`);
+  }
   if (!outcome.ok) process.exit(1); // harvest already reported and wrote the sidecar
 
   // ── SHOW_TAPS. Over the stitched take, before tighten touches it. This runs even when the
@@ -2004,12 +2214,16 @@ async function main() {
     console.error(`[film-android]   maestro debug output: ${debugDir}`);
     console.error(`[film-android]   the recording was still written, WITHOUT indicators: ${outPath}`);
     console.error('[film-android]   pass --no-show-taps to film without them on purpose.');
+    await markFailed();
     await writeSidecarSafely({
       status: 'taps-missing',
       error: `tap indicators could not be derived: ${why}`,
       finalProbe: outcome.finalProbe,
       stitch: outcome.stitch,
+      trim: outcome.trim ?? null,
+      durations: outcome.durations ?? null,
     });
+    console.error(`[film-android] renamed to ${outPath} so the take number stays free.`);
     process.exit(1);
   }
   if (tapError) log(`⚠️  no tap indicators drawn — ${tapError}`);
@@ -2017,11 +2231,14 @@ async function main() {
   if (maestroError) {
     // An interloper outranks a flow failure as the diagnosis, because in --guard-strict it CAUSED
     // it — the flow "failed" only in the sense that the guard shot it. Both reasons are kept.
+    await markFailed();
     await writeSidecarSafely({
       status: interloped() ? 'interloper' : 'flow-failed',
       error: [interloperReason(), maestroError.message].filter(Boolean).join('; '),
       finalProbe: outcome.finalProbe,
       stitch: outcome.stitch,
+      trim: outcome.trim ?? null,
+      durations: outcome.durations ?? null,
     });
     if (abortedByGuard) {
       console.error(`\n[film-android] the flow was stopped by --guard-strict, not by its own steps.`);
@@ -2062,6 +2279,9 @@ async function main() {
   } else if (doTighten) {
     try {
       const result = await tighten(outPath, {
+        minStill,
+        keep,
+        noise,
         // Rings were burned in, so freeze detection against outPath would be reading the burn's
         // own quantization noise, not the recorder's — see DETECT-FROM in tighten.mjs's header.
         // Without rings (no taps, or --no-show-taps) this stays undefined and tighten runs exactly
@@ -2106,15 +2326,25 @@ async function main() {
 
   const incomplete = truncationReason();
   const covered = interloperReason();
+  const sizeFailed = outcome.sizeMismatch && strictSize ? `--strict-size: ${outcome.sizeMismatch}` : null;
+  const finalStatus = covered ? 'interloper' : incomplete ? 'truncated' : sizeFailed ? 'failed' : 'ok';
+  const finalError = [covered, incomplete, sizeFailed].filter(Boolean).join('; ') || null;
+  if (finalStatus !== 'ok') await markFailed();
   await writeSidecarSafely({
     // "Something else was on screen" is a worse diagnosis than "some of the screen is missing",
     // and it is the one the operator has to act on, so it wins the single `status` slot.
-    status: covered ? 'interloper' : incomplete ? 'truncated' : 'ok',
-    error: [covered, incomplete].filter(Boolean).join('; ') || null,
+    status: finalStatus,
+    error: finalError,
     finalProbe: outcome.finalProbe,
     stitch: outcome.stitch,
+    trim: outcome.trim ?? null,
+    durations: outcome.durations ?? null,
     tightResult,
   });
+
+  if (finalStatus !== 'ok') {
+    console.error(`\n[film-android] renamed to ${outPath} so the take number stays free.`);
+  }
 
   if (incomplete) {
     console.error(
@@ -2131,7 +2361,8 @@ async function main() {
     );
   }
   // Non-zero on an interloper is the whole point: the flow passed, and the take still is not one.
-  if (covered || incomplete) process.exit(1);
+  // --strict-size failures and truncations exit non-zero for the same reason.
+  if (finalStatus !== 'ok') process.exit(1);
 }
 
 // Only film when this file is executed directly. The validation and stitch helpers above are
