@@ -1057,3 +1057,34 @@ EXIT=$?' > log 2>&1 &)`) and polling the log avoided it.
 **Fix:** the README's "run it and wait" framing invites this failure mode; worth a line for
 anyone driving filmkit from an agent shell rather than a human terminal.
 
+## 30. `--browser ego` timeline/video drift failed a re-film twice in a row on an identical flow (bug)
+
+**Wanted:** re-film `framing-studio.demo.mjs` (1440x900, `--browser ego`) after an app redeploy.
+The same flow at the same viewport on the same machine had filmed cleanly a day earlier
+(`framing-studio-demo.mp4`, sidecar shows `clock: "frame"`, no error).
+
+**Happened:** both attempts (`--name framing-studio-demo-v2`, back to back, ~94s captured each)
+failed the drift assertion in `filmWithEgo` (film-web.mjs:336):
+`the encoded video and the recorded timeline disagree by 0.080s` — attempt 1: 33 non-monotonic
+frame timestamps (video 94.112s vs timeline 94.032s); attempt 2: 39 (video 94.546s vs timeline
+94.466s). Same 0.080s drift both times despite a different non-monotonic count, which is
+suspicious in itself — see `lib/assemble.mjs`'s `MIN_FRAME_SEC` clamp: every clamped frame adds a
+few ms versus its (negative/zero) raw delta, so the total should scale with the count, not land
+on the same figure twice. The 1/30s (0.033s) threshold in film-web.mjs:335 is tight enough that a
+few dozen clamped frames out of ~3800 pushes a normally-clean take over it. Nothing in the flow
+file changed between the clean run and these two failures, and no selector or wait was at fault —
+this is CDP screencast frame timestamps arriving non-monotonic (jitter under whatever load ego /
+the machine was under at record time), not a flow authoring problem. Both failed runs still wrote
+a usable-looking raw `<name>.mp4` (assembled before the check), which is a fine debugging asset
+but was renamed out of the way rather than left blocking a retry under the same `--name`, since
+the standard overwrite refusal treats it as a real take.
+
+**Fix:** the suspicion above was right — it was the `MIN_FRAME_SEC` clamp, not real drift. Both
+takes had a handful of frames land within a millisecond or two of the one before (in attempt 2,
+only 1 of the 39 flagged gaps was actually out of order; the other 38 were just close together),
+and `assembleFromFrames` was flooring every one of those gaps up to 1/240s, padding a few ms per
+frame onto the encoded total. `lib/assemble.mjs` no longer floors anything: a positive gap,
+however small, is kept exactly as captured (`-vf fps=30` folds sub-frame durations in fine on the
+way into x264), and only a genuinely non-monotonic frame gets dropped, its time folded into the
+frame before it. The encoded total now equals the timeline's span exactly instead of drifting with
+the non-monotonic count.
