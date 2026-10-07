@@ -1,0 +1,96 @@
+#!/bin/sh
+# filmkit launcher: the one command the film-demo skill runs. POSIX sh, so it can explain a missing
+# Node.js instead of failing to start.
+#
+#   filmkit <command> [args...]      commands: see usage() below
+#
+# FINDING THE CHECKOUT. setup.sh symlinks this skill's directory into Claude Code's skills directory,
+# so this file is usually run as ~/.claude/skills/film-demo/filmkit, a path whose DIRECTORY is the
+# symlink. `cd <dir> && pwd -P` resolves that; the loop first follows the file itself in case it was
+# linked on its own (e.g. into ~/bin). No realpath(1) or readlink -f: neither is on older macOS.
+# MEASURED (before this file existed): node normalizes `..` lexically, so a path built from the skill
+# directory, `.../skills/film-demo/../../film-web.mjs`, names ~/.claude/film-web.mjs and fails; the
+# checkout must be found from the resolved directory.
+#
+# EXEC, NOT A CHILD: every command replaces this shell, so a signal (Ctrl-C, an agent shell's SIGHUP)
+# reaches the camera directly and its salvage rules hold exactly as with `node film-web.mjs`, and the
+# exit code is the camera's own.
+unset CDPATH
+p=$0
+while [ -L "$p" ]; do
+  l=$(readlink "$p")
+  case $l in
+    /*) p=$l ;;
+    *) p=$(dirname "$p")/$l ;;
+  esac
+done
+here=$(cd "$(dirname "$p")" && pwd -P) || exit 1
+root=$(cd "$here/../.." && pwd -P) || exit 1
+if [ ! -f "$root/film-web.mjs" ] || [ ! -f "$root/lib/prereqs.sh" ]; then
+  echo "filmkit: this launcher must live in <filmkit checkout>/skills/film-demo/, but $root is not a filmkit checkout." >&2
+  echo "Run setup.sh from your filmkit checkout again to relink the skill." >&2
+  exit 1
+fi
+. "$root/lib/prereqs.sh"
+filmkit_add_brew_path
+
+usage() {
+  cat <<EOF
+usage: $0 <command> [args...]
+
+  web <flow.demo.mjs> ...      film a web app (film-web.mjs)
+  android <flow.yaml> ...      film an Android app (film-android.mjs)
+  ios <flow.yaml> ...          film an iOS Simulator app (film-ios.mjs)
+  tighten <video.mp4> ...      cut dead air out of any video (tighten.mjs)
+  timeline <take.mp4> ...      list a take's screen changes (tools/timeline.mjs)
+  hierarchy ...                readable \`maestro hierarchy\` (tools/hierarchy.mjs)
+  scenario <flow.demo.mjs> ... re-emit a web flow's Playwright test (tools/scenario.mjs)
+  explore <url-or-file> ...    look at a page before writing a flow: selectors + a screenshot (tools/explore.mjs)
+  doctor                       what each camera needs, what is missing, and how to fix it
+  detach <log> <command> ...   run any command above in the background, surviving the shell that
+                               started it; its output goes to <log>, ending with a line EXIT=<code>
+  setup                        install or repair filmkit (runs setup.sh; safe to run again)
+  root                         print the filmkit checkout's path
+
+filmkit checkout: $root
+EOF
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case $cmd in
+  root)
+    echo "$root"
+    exit 0
+    ;;
+  help | -h | --help)
+    usage
+    exit 0
+    ;;
+  setup) exec sh "$root/setup.sh" "$@" ;;
+esac
+
+filmkit_check_node >&2 || exit 1
+
+case $cmd in
+  web) exec node "$root/film-web.mjs" "$@" ;;
+  android) exec node "$root/film-android.mjs" "$@" ;;
+  ios) exec node "$root/film-ios.mjs" "$@" ;;
+  tighten) exec node "$root/tighten.mjs" "$@" ;;
+  timeline) exec node "$root/tools/timeline.mjs" "$@" ;;
+  hierarchy) exec node "$root/tools/hierarchy.mjs" "$@" ;;
+  scenario) exec node "$root/tools/scenario.mjs" "$@" ;;
+  explore) exec node "$root/tools/explore.mjs" "$@" ;;
+  doctor) exec node "$root/tools/doctor.mjs" "$@" ;;
+  # In its own session, so the shell that started it can end without stopping it (tools/detach.mjs).
+  detach)
+    log=${1-}
+    [ $# -gt 0 ] && shift
+    exec node "$root/tools/detach.mjs" "$log" "$here/filmkit" "$@"
+    ;;
+  *)
+    echo "filmkit: unknown command \"$cmd\"" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

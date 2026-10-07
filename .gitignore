@@ -1,3 +1,5 @@
 node_modules/
 out/
+# flow files written for your own videos (see skills/film-demo/SKILL.md); never committed
+flows/
 .DS_Store
