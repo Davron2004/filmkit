@@ -14,6 +14,16 @@
 # pause below is `extendedWaitUntil: { visible: <marker that will never appear>, timeout: <ms>,
 # optional: true }` — it blocks for the full timeout and `optional: true` demotes the inevitable
 # "not found" outcome to a WARNED step instead of failing the flow.
+#
+# PAUSE GATE: each pause is wrapped in `runFlow: { when: { true: "${FILMKIT_MODE != 'test'}" } }`.
+# film-ios passes `-e FILMKIT_MODE=film`, and the scenario wrapper it can emit (`--scenario`) runs this
+# flow with FILMKIT_MODE=test, so the pause is HELD when filming (and when you run the flow by hand
+# with the variable undefined) and SKIPPED in a test run, where it would only be dead time. Measured on
+# Maestro 2.6.0: a skipped gate costs well under a second, whereas `timeout: 0` still costs one failed
+# poll (~1s). NEVER put FILMKIT_MODE in this file's header `env:` — a header `env:` overrides both `-e`
+# and the wrapper's `runFlow env:`, so it would pin the mode. A bare, ungated pause stays valid for a
+# flow that does not care about test runs. filmkit sees gated pauses as "skipped in test mode" and
+# leaves the gate out of the wrapper's list of branches taken.
 appId: com.apple.Preferences   # ← replace with your app's bundle id
 ---
 # Beat 0 — launch into a known state. With --fresh --install <App> --app <bundle-id>, beat 0 is
@@ -23,21 +33,38 @@ appId: com.apple.Preferences   # ← replace with your app's bundle id
     visible: ".*Settings.*"   # regex visibility wait — a real readiness marker beats a blind sleep
     timeout: 5000
 
-# Beat 1 — dwell so the first screen reads on camera before anything moves.
-- extendedWaitUntil:
-    visible: "__filmkit_demo_pause_marker__"
-    timeout: 1800
-    optional: true
+# Beat 1 — dwell so the first screen reads on camera before anything moves. It doubles as the
+# settle before the tap below: Maestro reads the hierarchy, then taps that point a moment later,
+# and a row that appears in between (Settings inserts a banner a second or two after it first
+# renders) shifts the list, so the tap lands on the wrong row and the ring honestly shows it.
+# `waitForAnimationToEnd` on both sides of the dwell, and a dwell longer than the late arrival,
+# made the tap land on the intended row in 6 of 6 takes (a bare `waitForAnimationToEnd` alone, or
+# the old 1.8s dwell, missed about half of them).
+- waitForAnimationToEnd:
+    timeout: 4000
+- runFlow:
+    when: { true: "${FILMKIT_MODE != 'test'}" }
+    commands:
+      - extendedWaitUntil: { visible: "__filmkit_demo_pause_marker__", timeout: 2500, optional: true }
+- waitForAnimationToEnd:
+    timeout: 4000
 
 # Beat 2 — an interaction via visible text.
 - tapOn: "General"
-- extendedWaitUntil:
-    visible: "__filmkit_demo_pause_marker__"
-    timeout: 1200
-    optional: true
+- runFlow:
+    when: { true: "${FILMKIT_MODE != 'test'}" }
+    commands:
+      - extendedWaitUntil: { visible: "__filmkit_demo_pause_marker__", timeout: 1200, optional: true }
 
 # Beat 3 — end on a held beat so the tightened video doesn't clip the last action.
-- extendedWaitUntil:
-    visible: "__filmkit_demo_pause_marker__"
-    timeout: 1600
-    optional: true
+# The `waitForAnimationToEnd` first is NOT decoration. Maestro 2.6 counts a wait's timeout from the START
+# of the previous wait when that one ended without matching (every pause does), and nothing has reset it
+# since: a pause directly after another wait holds only max(~0.4s, its timeout - the previous hold), so
+# this 1600ms beat came out at ~0.4s. A gate does not reset it. `waitForAnimationToEnd`, `tapOn`,
+# `evalScript` and `runScript` do (`assertVisible` and `takeScreenshot` do not). Two pauses in a row
+# always want one of those between them; the flow lint in film-android/film-ios warns about it.
+- waitForAnimationToEnd
+- runFlow:
+    when: { true: "${FILMKIT_MODE != 'test'}" }
+    commands:
+      - extendedWaitUntil: { visible: "__filmkit_demo_pause_marker__", timeout: 1600, optional: true }
