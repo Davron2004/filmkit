@@ -2,7 +2,7 @@
   "name": "filmkit",
   "private": true,
   "version": "0.1.0",
-  "description": "Film human-paced demo videos of any web or Android app: scripted flows + a dead-air cutter.",
+  "description": "Film human-paced demo videos of any web, Android or iOS app: scripted flows + a dead-air cutter.",
   "type": "module",
   "engines": {
     "node": ">=20"
