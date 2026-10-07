@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Page Builder</title>
+<!--
+  A stand-in for an app whose result is not deterministic: Generate -> "Generating…" for a random
+  2-6s -> either a preview ("Preview ready") or a build error ("Build failed", with Retry).
+  examples/web/generate.demo.mjs films it with stage.oneOf().
+
+  ?outcome=ok or ?outcome=fail forces the result (every attempt, retries included); anything else,
+  or no parameter, picks one at random per attempt. The wait is always random.
+
+  The "Generating…" state is deliberately STATIC (no spinner, no progress bar): a real generation
+  wait is dead air, and a static one is what lets tighten cut it out of the take.
+
+  Layout: the result panel has a fixed height, so the card never changes size and nothing on the
+  page moves when the state changes. The card sits above the caption bar the stage draws at the
+  bottom of the viewport. The 20px between the Generate button and the result panel is an element
+  (data-testid="gap") rather than a margin, so a flow can rest the pointer there: stage.point() aims
+  at a target's center, and no other element's center falls between the two (the card's own center
+  is 5px inside the panel).
+-->
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font: 16px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif;
+    background: #f4f4f6; color: #17181c;
+  }
+  main {
+    width: 440px; margin-bottom: 72px; padding: 30px 32px 32px; border-radius: 16px; background: #fff;
+    box-shadow: 0 10px 30px rgba(0,0,0,.08);
+  }
+  h1 { margin: 0; font-size: 24px; line-height: 1.25; }
+  .lede { margin: 4px 0 20px; font-size: 15px; color: #6b6c75; }
+  label { display: block; margin-bottom: 14px; }
+  label span { display: block; font-size: 13px; font-weight: 600; color: #55565e; margin-bottom: 4px; }
+  input {
+    width: 100%; padding: 10px 12px; font: inherit; font-size: 17px;
+    border: 1px solid #d7d8de; border-radius: 8px; outline-color: #4f6ef7;
+  }
+  input::placeholder { color: #a3a4ad; }
+  input:disabled { background: #fafafb; color: #55565e; border-color: #e3e4ea; }
+  button {
+    font: inherit; font-size: 16px; font-weight: 600; cursor: pointer;
+    padding: 11px 18px; border-radius: 8px; border: 0;
+  }
+  .primary { width: 100%; color: #fff; background: #4f6ef7; }
+  .primary:hover { background: #3f5ce0; }
+  .primary:disabled { background: #b4c0f8; cursor: default; }
+  .secondary { padding: 8px 16px; font-size: 15px; color: #3f5ce0; background: #eef1fe; }
+  .secondary:hover { background: #e2e7fd; }
+
+  .gap { height: 20px; }
+  .result {
+    height: 236px; padding: 18px 20px;
+    border: 1px solid #ececf1; border-radius: 12px; background: #fafafb;
+    display: flex; flex-direction: column;
+  }
+  .result > [hidden] { display: none !important; }
+  .placeholder, .generating {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; color: #6b6c75;
+  }
+  .generating strong { font-size: 18px; color: #17181c; }
+  .generating small, .placeholder small { font-size: 14px; }
+
+  .state { flex: 1; display: flex; flex-direction: column; }
+  .head { display: flex; align-items: center; gap: 8px; font-size: 17px; font-weight: 700; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .ok .dot { background: #1f9d55; }
+  .bad .dot { background: #d64545; }
+
+  .frame {
+    flex: 1; margin: 12px 0 14px; border: 1px solid #e3e4ea; border-radius: 8px; overflow: hidden; background: #fff;
+    display: flex; flex-direction: column;
+  }
+  .frame .band { padding: 12px 14px; background: #4f6ef7; color: #fff; font-weight: 700; font-size: 15px; }
+  .frame .lines { padding: 10px 14px; display: grid; gap: 7px; }
+  .frame .lines i { display: block; height: 7px; border-radius: 4px; background: #e7e8ee; }
+  .frame .lines i:nth-child(2) { width: 82%; }
+  .frame .lines i:nth-child(3) { width: 64%; }
+  .row { display: flex; align-items: center; justify-content: space-between; min-height: 38px; }
+  .row .note { font-size: 14px; color: #6b6c75; }
+  .published { font-weight: 600; color: #1f9d55; }
+
+  .bad p { margin: 10px 0 0; font-size: 15px; color: #45464e; }
+  .bad code {
+    display: block; margin: 10px 0 14px; padding: 8px 10px; border-radius: 6px;
+    background: #fdf0f0; color: #a23030; font: 13px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .bad .row { margin-top: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Page Builder</h1>
+  <p class="lede">Describe a page and generate it.</p>
+  <label><span>Prompt</span><input id="prompt" type="text" placeholder="A bakery homepage" autocomplete="off"></label>
+  <button id="generate" class="primary" data-testid="generate">Generate</button>
+  <div class="gap" data-testid="gap" aria-hidden="true"></div>
+
+  <section class="result" aria-live="polite">
+    <div class="placeholder" data-testid="empty"><small>Your preview will appear here.</small></div>
+
+    <div class="generating" data-testid="generating" hidden>
+      <strong>Generating…</strong>
+      <small>This usually takes a few seconds.</small>
+    </div>
+
+    <div class="state ok" data-testid="preview" hidden>
+      <div class="head"><span class="dot"></span>Preview ready</div>
+      <div class="frame">
+        <div class="band" id="preview-title"></div>
+        <div class="lines"><i></i><i></i><i></i></div>
+      </div>
+      <div class="row">
+        <span class="note">Built and running.</span>
+        <button class="secondary" id="publish" data-testid="publish">Publish</button>
+        <span class="published" data-testid="publish-status" hidden>Published</span>
+      </div>
+    </div>
+
+    <div class="state bad" data-testid="build-error" hidden>
+      <div class="head"><span class="dot"></span>Build failed</div>
+      <p>The generated code did not compile (line 12).</p>
+      <code>SyntaxError: Unexpected token '}'</code>
+      <div class="row">
+        <span class="note">Nothing was published.</span>
+        <button class="secondary" id="retry" data-testid="retry">Retry</button>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.querySelector(`[data-testid="${id}"]`);
+  const views = ['empty', 'generating', 'preview', 'build-error'];
+  const prompt = document.getElementById('prompt');
+  const generate = $('generate');
+  const forced = new URLSearchParams(location.search).get('outcome');
+
+  function show(view) {
+    for (const v of views) $(v).hidden = v !== view;
+  }
+
+  function run() {
+    generate.disabled = true;
+    prompt.disabled = true;
+    show('generating');
+    const ok = forced === 'ok' ? true : forced === 'fail' ? false : Math.random() < 0.5;
+    const waitMs = 2000 + Math.random() * 4000;
+    setTimeout(() => {
+      if (ok) {
+        document.getElementById('preview-title').textContent = prompt.value.trim() || prompt.placeholder;
+        $('publish').hidden = false;
+        $('publish-status').hidden = true;
+        show('preview');
+      } else {
+        show('build-error');
+      }
+      generate.disabled = false;
+      prompt.disabled = false;
+    }, waitMs);
+  }
+
+  generate.addEventListener('click', run);
+  $('retry').addEventListener('click', run);
+  $('publish').addEventListener('click', () => {
+    $('publish').hidden = true;
+    $('publish-status').hidden = false;
+  });
+</script>
+</body>
+</html>

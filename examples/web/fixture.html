@@ -12,8 +12,10 @@
     font: 16px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif;
     background: #f4f4f6; color: #17181c;
   }
+  /* margin-bottom lifts the card clear of the caption bar the stage draws at the bottom of the viewport
+     (without it the bar overlapped the card's bottom edge); generate.html does the same. */
   main {
-    width: 380px; padding: 32px; border-radius: 16px; background: #fff;
+    width: 380px; margin-bottom: 72px; padding: 32px; border-radius: 16px; background: #fff;
     box-shadow: 0 10px 30px rgba(0,0,0,.08);
   }
   h1 { margin: 0 0 20px; font-size: 24px; }
@@ -23,6 +25,11 @@
     width: 100%; padding: 10px 12px; font-size: 18px;
     border: 1px solid #d7d8de; border-radius: 8px; outline-color: #4f6ef7;
   }
+  /* No native spinners: Chromium draws them on a hovered or focused number field, and the cursor
+     spends the whole demo on these fields. */
+  input[type=number] { appearance: textfield; }
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   .rows { margin: 18px 0; border-top: 1px solid #ececf1; }
   .row { display: flex; justify-content: space-between; padding: 9px 2px; font-size: 17px; }
   .row span:last-child { font-variant-numeric: tabular-nums; font-weight: 600; }
@@ -42,7 +49,7 @@
   <div class="rows">
     <div class="row"><span>Tip</span><span id="tip-amt"></span></div>
     <div class="row"><span>Total</span><span id="total"></span></div>
-    <div class="row"><span>Per person</span><span id="per-person"></span></div>
+    <div class="row" id="per-person-row"><span>Per person</span><span id="per-person"></span></div>
   </div>
   <button id="reset">Reset</button>
 </main>
